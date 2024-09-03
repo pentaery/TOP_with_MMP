@@ -52,7 +52,7 @@ endif (CXX_FLAGS)
 project(PreMixFEM)
 set(SOURCES 
  src/PreMixFEM_3D.c
- src/main.c
+ src/testDM.c
  src/topopt3D/optimization.c
  src/topopt3D/system.c
  src/topopt3D/oCriteria.c
