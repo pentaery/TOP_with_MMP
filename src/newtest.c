@@ -105,12 +105,7 @@ int main(int argc, char **argv) {
     PetscCall(PCMGSetInterpolation(pc, 1, R_c));
     PetscCall(PCMGSetInterpolation(pc, 2, R_cc));
     // 设置工作变量
-    PCMGSetRhs(pc, 2, Vec b);
-    PCMGSetX(pc, 2, Vec x);
-    PCMGSetR(pc, 2, Vec r);
-    PCMGSetRhs(pc, 3, Vec b);
-    PCMGSetX(pc, 3, Vec x);
-    PCMGSetR(pc, 3, Vec r);
+
     PetscCall(
         PCShellSetName(pc, "3levels-MG-via-GMsFEM-with-velocity-elimination"));
   } else {
