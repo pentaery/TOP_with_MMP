@@ -28,7 +28,7 @@ int main(int argc, char **argv) {
       SlepcInitialize(&argc, &argv, (char *)0, "Toplogical Optimiazation\n"));
   PCCtx test;
   MMAx mmax;
-  PetscInt grid = 4;
+  PetscInt grid = 8;
   PetscInt iter_number = 60;
   PetscBool petsc_default = PETSC_FALSE;
 
