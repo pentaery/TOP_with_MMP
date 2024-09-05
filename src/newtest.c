@@ -28,7 +28,7 @@ int main(int argc, char **argv) {
       SlepcInitialize(&argc, &argv, (char *)0, "Toplogical Optimiazation\n"));
   PCCtx test;
   MMAx mmax;
-  PetscInt grid = 20;
+  PetscInt grid = 4;
   PetscInt iter_number = 60;
   PetscBool petsc_default = PETSC_FALSE;
 
@@ -67,6 +67,8 @@ int main(int argc, char **argv) {
   PetscCall(formMatrix(&test, A));
   PetscCall(formRHS(&test, rhs, x, penal));
   PetscCall(KSPSetOperators(ksp, A, A));
+
+  PetscCall(PC_setup(&test));
 
   
 
@@ -125,7 +127,7 @@ int main(int argc, char **argv) {
   PetscCall(VecDestroy(&x));
 
   PetscCall(KSPDestroy(&ksp));
-  PetscCall(mmaFinal(&mmax));
+  // PetscCall(mmaFinal(&mmax));
 
   PetscCall(SlepcFinalize());
 }

@@ -34,7 +34,6 @@ typedef struct preconditioner_context {
   Vec kappa[DIM], *ms_bases_c, *ms_bases_cc;
   Vec cost;
   Vec boundary;
-  KSP *ksp_lv1, ksp_lv2, ksp_lv3;
   PetscInt *coarse_startx, *coarse_lenx, *coarse_starty, *coarse_leny,
       *coarse_startz, *coarse_lenz;
   PetscInt sub_domains, lv2_eigen_op;
@@ -64,8 +63,7 @@ PetscErrorCode PC_final_default(PCCtx *s_ctx);
 
 PetscErrorCode PC_final(PCCtx *s_ctx);
 
-
-    /* According to Wiki, it may help... */
-    int mkl_serv_intel_cpu_true();
+/* According to Wiki, it may help... */
+int mkl_serv_intel_cpu_true();
 
 #endif
