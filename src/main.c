@@ -31,16 +31,17 @@ int main(int argc, char **argv) {
   PetscInt iter_number = 60;
   PetscInt output_frequency = 10;
   PetscLogEvent linearsolve, optimize;
-  PetscBool petsc_default = PETSC_FALSE, xvalue_default = PETSC_FALSE;
+  PetscBool xvalue_default = PETSC_FALSE;
   char filename[80] = "hello.txt";
   PetscCall(PetscLogEventRegister("LinearSolve", 0, &linearsolve));
   PetscCall(PetscLogEventRegister("Optimization", 1, &optimize));
 
   PetscCall(PetscOptionsGetInt(NULL, NULL, "-mesh", &grid, NULL));
   PetscCall(PetscOptionsGetInt(NULL, NULL, "-iter", &iter_number, NULL));
-  PetscCall(PetscOptionsHasName(NULL, NULL, "-petsc_default", &petsc_default));
-  PetscCall(PetscOptionsHasName(NULL, NULL, "-xvalue_default", &xvalue_default));
-  PetscCall(PetscOptionsGetInt(NULL, NULL, "-frequency", &output_frequency, NULL));
+  PetscCall(
+      PetscOptionsHasName(NULL, NULL, "-xvalue_default", &xvalue_default));
+  PetscCall(
+      PetscOptionsGetInt(NULL, NULL, "-frequency", &output_frequency, NULL));
   PetscCall(PetscOptionsGetString(NULL, NULL, "-itername", filename, 20, NULL));
   PetscInt mesh[3] = {grid, grid, grid};
   PetscScalar dom[3] = {1.0, 1.0, 1.0};
@@ -52,13 +53,11 @@ int main(int argc, char **argv) {
   KSP ksp;
   PetscInt loop = 0, iter = 0, penal = 3;
   PetscScalar change = 1, tau = 0, xvolfrac = 0;
-  PetscScalar residual;
 
   char str[80];
 
   PetscCall(PC_init(&test, dom, mesh));
   PetscCall(mmaInit(&test, &mmax));
-  PetscCall(PC_print_info(&test));
 
   PetscCall(DMCreateMatrix(test.dm, &A));
   PetscCall(DMCreateGlobalVector(test.dm, &rhs));
@@ -77,23 +76,20 @@ int main(int argc, char **argv) {
   // PetscCall(KSPSetInitialGuessNonzero(ksp, PETSC_TRUE));
   PetscCall(KSPSetFromOptions(ksp));
 
-
-  if(!xvalue_default){
-  PetscCall(PetscPrintf(PETSC_COMM_WORLD, "Using loaded vector\n"));
-  PetscViewer h5_viewer;
-  PetscCall(PetscViewerHDF5Open(PETSC_COMM_WORLD,
-                                "../data/save/xvalue0020.h5", FILE_MODE_READ,
-                                &h5_viewer));
-  PetscCall(VecLoad(x, h5_viewer));
-  PetscCall(PetscViewerDestroy(&h5_viewer));
+  if (!xvalue_default) {
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD, "Using loaded vector\n"));
+    PetscViewer h5_viewer;
+    PetscCall(PetscViewerHDF5Open(PETSC_COMM_WORLD,
+                                  "../data/save/xvalue0020.h5", FILE_MODE_READ,
+                                  &h5_viewer));
+    PetscCall(VecLoad(x, h5_viewer));
+    PetscCall(PetscViewerDestroy(&h5_viewer));
   } else {
-  PetscCall(PetscPrintf(PETSC_COMM_WORLD, "Using default vector\n"));
-  PetscCall(VecSet(x, volfrac));
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD, "Using default vector\n"));
+    PetscCall(VecSet(x, volfrac));
   }
   PetscCall(VecCopy(x, mmax.xlast));
   // PetscCall(VecSet(mmax.xlast, volfrac));
-
-
 
   PetscCall(formBoundary(&test));
   while (PETSC_TRUE) {
@@ -118,30 +114,21 @@ int main(int argc, char **argv) {
     //   PetscViewer viewer;
     //   sprintf(str, "../data/output2/tvalue%04d.vtr", loop);
     //   PetscCall(
-    //       PetscViewerVTKOpen(PETSC_COMM_WORLD, str, FILE_MODE_WRITE, &viewer));
+    //       PetscViewerVTKOpen(PETSC_COMM_WORLD, str, FILE_MODE_WRITE,
+    //       &viewer));
     //   PetscCall(VecView(t, viewer));
     //   PetscCall(PetscViewerDestroy(&viewer));
     // }
-    
+
     PetscCall(formkappa(&test, x, penal));
     PetscCall(formMatrix(&test, A));
     PetscCall(formRHS(&test, rhs, x, penal));
     PetscCall(KSPSetOperators(ksp, A, A));
 
-
-
     PC pc;
     PetscCall(KSPGetPC(ksp, &pc));
-    if (!petsc_default) {
-      PetscCall(PCSetType(pc, PCSHELL));
-      PetscCall(PCShellSetContext(pc, &test));
-      PetscCall(PCShellSetSetUp(pc, PC_setup));
-      PetscCall(PCShellSetApply(pc, PC_apply_vec));
-      PetscCall(PCShellSetName(
-          pc, "3levels-MG-via-GMsFEM-with-velocity-elimination"));
-    } else {
-      PetscCall(PCSetType(pc, PCGAMG));
-    }
+
+    PetscCall(PCSetType(pc, PCGAMG));
 
     PetscCall(PetscLogEventBegin(linearsolve, 0, 0, 0, 0));
 
@@ -149,17 +136,7 @@ int main(int argc, char **argv) {
 
     PetscCall(PetscLogEventEnd(linearsolve, 0, 0, 0, 0));
 
-    if(!petsc_default){
-      PetscCall(PC_print_stat(&test));
-    }
-
     PetscCall(KSPConvergedReasonView(ksp, PETSC_VIEWER_STDOUT_WORLD));
-    // PetscCall(MatMult(A, t, y));
-    // PetscCall(VecAXPY(y, -1.0, rhs));
-    // PetscCall(VecNorm(y, NORM_2, &residual));
-    // PetscCall(PetscPrintf(PETSC_COMM_WORLD, "The norm of residual is: %f\n", residual));
-    // PetscCall(VecNorm(rhs, NORM_2, &residual));
-    // PetscCall(PetscPrintf(PETSC_COMM_WORLD, "The norm of RHS is: %f\n", residual));
     PetscCall(KSPGetIterationNumber(ksp, &iter));
     it[loop - 1] = iter;
     PetscCall(VecMax(t, NULL, &tau));
@@ -171,11 +148,8 @@ int main(int argc, char **argv) {
     PetscCall(PetscPrintf(PETSC_COMM_WORLD, "cost: %f\n", cost));
     tem[loop - 1] = cost;
 
-
     PetscCall(VecSet(dc, 0));
 
-
-  
     PetscCall(PetscLogEventBegin(optimize, 0, 0, 0, 0));
     PetscCall(adjointGradient(&test, &mmax, ksp, A, mmax.xlast, t, dc, penal));
     PetscCall(mmaLimit(&test, &mmax, loop));
@@ -183,36 +157,27 @@ int main(int argc, char **argv) {
     PetscCall(subSolv(&test, &mmax, x));
     PetscCall(PetscLogEventEnd(optimize, 0, 0, 0, 0));
 
-
-
-
     PetscCall(computeChange(&mmax, x, &change));
     PetscCall(PetscPrintf(PETSC_COMM_WORLD, "change: %f\n", change));
-
-
-  }
-  
-  if (!petsc_default) {
-    PetscCall(PC_final(&test));
   }
 
+
+  PetscCall(PC_final(&test));
 
 
   FILE *fp = fopen(filename, "w");
-  if(fp == NULL){
+  if (fp == NULL) {
     printf("Error opening file\n");
     return 1;
   }
-  for(int i = 0; i < iter_number; i++){
+  for (int i = 0; i < iter_number; i++) {
     fprintf(fp, "%d ", it[i]);
   }
   fprintf(fp, "\n");
-  for(int i = 0; i < iter_number; i++){
+  for (int i = 0; i < iter_number; i++) {
     fprintf(fp, "%f ", tem[i]);
   }
   fclose(fp);
-
-
 
   PetscCall(MatDestroy(&A));
   PetscCall(VecDestroy(&rhs));

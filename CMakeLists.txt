@@ -51,8 +51,8 @@ endif (CXX_FLAGS)
 #  this must appear AFTER the compilers are set
 project(PreMixFEM)
 set(SOURCES 
- src/newPre.c
  src/newtest.c
+ src/PreMixFEM_3D.c
  src/topopt3D/optimization.c
  src/topopt3D/system.c
  src/topopt3D/oCriteria.c
