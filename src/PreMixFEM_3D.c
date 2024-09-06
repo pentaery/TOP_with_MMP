@@ -44,15 +44,15 @@ void _PC_get_coarse_elem_corners(PCCtx *s_ctx, const PetscInt coarse_elem,
 }
 
 // 获取第coarse_elem个粗网格的自由度索引
-void _PC_get_dof_idx(PCCtx *s_ctx, PetscInt *dof_idx) {
-  PetscInt coarse_elem,
-      coarse_elem_num =
-          s_ctx->sub_domains * s_ctx->sub_domains * s_ctx->sub_domains;
-  dof_idx[0] = 0;
-  for (coarse_elem = 0; coarse_elem < coarse_elem_num; ++coarse_elem)
-    dof_idx[coarse_elem + 1] =
-        dof_idx[coarse_elem] + s_ctx->eigen_num_lv1[coarse_elem];
-}
+// void _PC_get_dof_idx(PCCtx *s_ctx, PetscInt *dof_idx) {
+//   PetscInt coarse_elem,
+//       coarse_elem_num =
+//           s_ctx->sub_domains * s_ctx->sub_domains * s_ctx->sub_domains;
+//   dof_idx[0] = 0;
+//   for (coarse_elem = 0; coarse_elem < coarse_elem_num; ++coarse_elem)
+//     dof_idx[coarse_elem + 1] =
+//         dof_idx[coarse_elem] + s_ctx->eigen_num_lv1[coarse_elem];
+// }
 
 // 获得所有coarse element的起始点和长度
 PetscErrorCode domainPartition(PCCtx *s_ctx, _IntCtx *int_ctx) {
@@ -105,9 +105,6 @@ PetscErrorCode formRc(PCCtx *s_ctx, _IntCtx *int_ctx) {
   PetscCall(DMGetGlobalVector(s_ctx->dm, &getIndex));
   PetscCall(VecGetOwnershipRange(getIndex, &firstcol, &lastcol));
   PetscCall(MatGetOwnershipRange(s_ctx->Rc, &firstrow, &lastrow));
-  PetscInt m, n;
-  PetscCall(MatGetSize(s_ctx->Rc, &m, &n));
-  PetscCall(PetscPrintf(PETSC_COMM_WORLD, "m=%d, n=%d\n", m, n));
 
   for (i = 0; i < s_ctx->max_eigen_num_lv1; ++i) {
     PetscCall(DMGetLocalVector(s_ctx->dm, &(int_ctx->ms_bases_c_tmp[i])));
@@ -358,7 +355,7 @@ PetscErrorCode formRc(PCCtx *s_ctx, _IntCtx *int_ctx) {
                               int_ctx->ms_bases_c_tmp[i]));
   }
   PetscCall(DMRestoreGlobalVector(s_ctx->dm, &dummy_ms_bases_glo));
-
+  PetscCall(VecDestroy(&getIndex));
   PetscFunctionReturn(0);
 }
 
@@ -383,6 +380,12 @@ PetscErrorCode formRcc(PCCtx *s_ctx, _IntCtx *int_ctx) {
                             int_ctx->coarse_elem_num * s_ctx->max_eigen_num_lv1,
                             int_ctx->coarse_elem_num * s_ctx->max_eigen_num_lv1,
                             7 * s_ctx->max_eigen_num_lv1, NULL, &A_i_inner));
+  PetscInt m, n;
+  PetscCall(MatGetSize(A_i_inner, &m, &n));
+  PetscCall(PetscPrintf(PETSC_COMM_SELF, "m=%d, n=%d\n", m, n));
+  PetscCall(PetscPrintf(PETSC_COMM_SELF, "coarse_elem_num=%d\n",
+                        int_ctx->coarse_elem_num));
+
   for (coarse_elem = 0; coarse_elem < int_ctx->coarse_elem_num; ++coarse_elem) {
     _PC_get_coarse_elem_xyz(s_ctx, coarse_elem, &coarse_elem_x, &coarse_elem_y,
                             &coarse_elem_z);
@@ -390,8 +393,10 @@ PetscErrorCode formRcc(PCCtx *s_ctx, _IntCtx *int_ctx) {
                                 &startz, &nz);
     for (i = 0; i < s_ctx->max_eigen_num_lv1; ++i) {
       row = coarse_elem * s_ctx->max_eigen_num_lv1 + i;
+      PetscCall(PetscPrintf(PETSC_COMM_SELF, "row=%d\n", row));
       for (j = 0; j < s_ctx->max_eigen_num_lv1; ++j) {
         col = coarse_elem * s_ctx->max_eigen_num_lv1 + j;
+        PetscCall(PetscPrintf(PETSC_COMM_SELF, "col=%d\n", col));
         val_A = 0.0;
         for (ez = startz; ez < startz + nz; ++ez)
           for (ey = starty; ey < starty + ny; ++ey)
@@ -486,12 +491,12 @@ PetscErrorCode formRcc(PCCtx *s_ctx, _IntCtx *int_ctx) {
         PetscCall(
             MatSetValues(A_i_inner, 1, &row, 1, &col, &val_A, INSERT_VALUES));
       }
-
+      PetscCall(PetscPrintf(PETSC_COMM_SELF, "HELLO\n"));
       if (coarse_elem_x != 0) {
         coarse_elem_col =
             coarse_elem_z * s_ctx->sub_domains * s_ctx->sub_domains +
             coarse_elem_y * s_ctx->sub_domains + coarse_elem_x - 1;
-        for (j = 0; j < s_ctx->eigen_num_lv1[coarse_elem_col]; ++j) {
+        for (j = 0; j < (coarse_elem_col * s_ctx->max_eigen_num_lv1); ++j) {
           col = coarse_elem_col * s_ctx->max_eigen_num_lv1 + j;
           val_A = 0.0;
           for (ez = startz; ez < startz + nz; ++ez)
@@ -513,7 +518,7 @@ PetscErrorCode formRcc(PCCtx *s_ctx, _IntCtx *int_ctx) {
         coarse_elem_col =
             coarse_elem_z * s_ctx->sub_domains * s_ctx->sub_domains +
             coarse_elem_y * s_ctx->sub_domains + coarse_elem_x + 1;
-        for (j = 0; j < s_ctx->eigen_num_lv1[coarse_elem_col]; ++j) {
+        for (j = 0; j < (coarse_elem_col * s_ctx->max_eigen_num_lv1); ++j) {
           col = coarse_elem_col * s_ctx->max_eigen_num_lv1 + j;
           val_A = 0.0;
           for (ez = startz; ez < startz + nz; ++ez)
@@ -527,6 +532,8 @@ PetscErrorCode formRcc(PCCtx *s_ctx, _IntCtx *int_ctx) {
                        arr_ms_bases_c_array[i][ez][ey][startx + nx - 1] *
                        arr_ms_bases_c_array[j][ez][ey][startx + nx];
             }
+          PetscCall(PetscPrintf(PETSC_COMM_SELF, "rowA=%d\n", row));
+          PetscCall(PetscPrintf(PETSC_COMM_SELF, "colA=%d\n", col));
           PetscCall(
               MatSetValues(A_i_inner, 1, &row, 1, &col, &val_A, INSERT_VALUES));
         }
@@ -536,7 +543,7 @@ PetscErrorCode formRcc(PCCtx *s_ctx, _IntCtx *int_ctx) {
         coarse_elem_col =
             coarse_elem_z * s_ctx->sub_domains * s_ctx->sub_domains +
             (coarse_elem_y - 1) * s_ctx->sub_domains + coarse_elem_x;
-        for (j = 0; j < s_ctx->eigen_num_lv1[coarse_elem_col]; ++j) {
+        for (j = 0; j < (coarse_elem_col * s_ctx->max_eigen_num_lv1); ++j) {
           col = coarse_elem_col * s_ctx->max_eigen_num_lv1 + j;
           val_A = 0.0;
           for (ez = startz; ez < startz + nz; ++ez)
@@ -558,7 +565,7 @@ PetscErrorCode formRcc(PCCtx *s_ctx, _IntCtx *int_ctx) {
         coarse_elem_col =
             coarse_elem_z * s_ctx->sub_domains * s_ctx->sub_domains +
             (coarse_elem_y + 1) * s_ctx->sub_domains + coarse_elem_x;
-        for (j = 0; j < s_ctx->eigen_num_lv1[coarse_elem_col]; ++j) {
+        for (j = 0; j < (coarse_elem_col * s_ctx->max_eigen_num_lv1); ++j) {
           col = coarse_elem_col * s_ctx->max_eigen_num_lv1 + j;
           val_A = 0.0;
           for (ez = startz; ez < startz + nz; ++ez)
@@ -572,6 +579,8 @@ PetscErrorCode formRcc(PCCtx *s_ctx, _IntCtx *int_ctx) {
                        arr_ms_bases_c_array[i][ez][starty + ny - 1][ex] *
                        arr_ms_bases_c_array[j][ez][starty + ny][ex];
             }
+          // PetscCall(PetscPrintf(PETSC_COMM_SELF, "rowA=%d\n", row));
+          // PetscCall(PetscPrintf(PETSC_COMM_SELF, "colA=%d\n", col));
           PetscCall(
               MatSetValues(A_i_inner, 1, &row, 1, &col, &val_A, INSERT_VALUES));
         }
@@ -581,7 +590,7 @@ PetscErrorCode formRcc(PCCtx *s_ctx, _IntCtx *int_ctx) {
         coarse_elem_col =
             (coarse_elem_z - 1) * s_ctx->sub_domains * s_ctx->sub_domains +
             coarse_elem_y * s_ctx->sub_domains + coarse_elem_x;
-        for (j = 0; j < s_ctx->eigen_num_lv1[coarse_elem_col]; ++j) {
+        for (j = 0; j < (coarse_elem_col * s_ctx->max_eigen_num_lv1); ++j) {
           col = coarse_elem_col * s_ctx->max_eigen_num_lv1 + j;
           val_A = 0.0;
           for (ey = starty; ey < starty + ny; ++ey)
@@ -594,6 +603,7 @@ PetscErrorCode formRcc(PCCtx *s_ctx, _IntCtx *int_ctx) {
                        arr_ms_bases_c_array[i][startz][ey][ex] *
                        arr_ms_bases_c_array[j][startz - 1][ey][ex];
             }
+
           PetscCall(
               MatSetValues(A_i_inner, 1, &row, 1, &col, &val_A, INSERT_VALUES));
         }
@@ -603,7 +613,7 @@ PetscErrorCode formRcc(PCCtx *s_ctx, _IntCtx *int_ctx) {
         coarse_elem_col =
             (coarse_elem_z + 1) * s_ctx->sub_domains * s_ctx->sub_domains +
             coarse_elem_y * s_ctx->sub_domains + coarse_elem_x;
-        for (j = 0; j < s_ctx->eigen_num_lv1[coarse_elem_col]; ++j) {
+        for (j = 0; j < (coarse_elem_col * s_ctx->max_eigen_num_lv1); ++j) {
           col = coarse_elem_col * s_ctx->max_eigen_num_lv1 + j;
           val_A = 0.0;
           for (ey = starty; ey < starty + ny; ++ey)
@@ -616,7 +626,11 @@ PetscErrorCode formRcc(PCCtx *s_ctx, _IntCtx *int_ctx) {
                        int_ctx->meas_elem * avg_kappa_e *
                        arr_ms_bases_c_array[i][startz + nz - 1][ey][ex] *
                        arr_ms_bases_c_array[j][startz + nz][ey][ex];
+              PetscCall(PetscPrintf(PETSC_COMM_SELF, "val_A=%f\n", val_A));
+              
             }
+          PetscCall(PetscPrintf(PETSC_COMM_SELF, "rowA=%d\n", row));
+          PetscCall(PetscPrintf(PETSC_COMM_SELF, "colA=%d\n", col));
           PetscCall(
               MatSetValues(A_i_inner, 1, &row, 1, &col, &val_A, INSERT_VALUES));
         }
@@ -784,14 +798,20 @@ PetscErrorCode PC_setup(PCCtx *s_ctx) {
       MatCreateAIJ(PETSC_COMM_WORLD, coarse_elem_num * s_ctx->max_eigen_num_lv1,
                    proc_nx * proc_ny * proc_nz, PETSC_DEFAULT, PETSC_DEFAULT,
                    eigen_len_lv1_max, NULL, 0, NULL, &s_ctx->Rc));
-  
+
   PetscCall(MatCreateAIJ(
       PETSC_COMM_WORLD, s_ctx->max_eigen_num_lv2,
       coarse_elem_num * s_ctx->max_eigen_num_lv1, PETSC_DEFAULT, PETSC_DEFAULT,
       coarse_elem_num * s_ctx->max_eigen_num_lv1, NULL, 0, NULL, &s_ctx->Rcc));
 
+  PetscInt m, n;
+  PetscCall(MatGetSize(s_ctx->Rc, &m, &n));
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD, "m1=%d, n1=%d\n", m, n));
+  PetscCall(MatGetSize(s_ctx->Rcc, &m, &n));
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD, "m1=%d, n1=%d\n", m, n));
+
   PetscCall(formRc(s_ctx, &int_ctx));
-  // PetscCall(formRcc(s_ctx, &int_ctx));
+  PetscCall(formRcc(s_ctx, &int_ctx));
 
   PetscFunctionReturn(0);
   // }
@@ -819,7 +839,7 @@ PetscErrorCode PC_init(PCCtx *s_ctx, PetscScalar *dom, PetscInt *mesh) {
   PetscCheck(s_ctx->sub_domains >= 1, PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
              "Error in sub_domains=%d.\n", s_ctx->sub_domains);
 
-  s_ctx->max_eigen_num_lv1 = 4;
+  s_ctx->max_eigen_num_lv1 = 1;
   PetscCall(PetscOptionsGetInt(NULL, NULL, "-en_lv1", &s_ctx->max_eigen_num_lv1,
                                NULL));
   PetscCheck(s_ctx->max_eigen_num_lv1 >= 1, PETSC_COMM_WORLD,
@@ -827,7 +847,7 @@ PetscErrorCode PC_init(PCCtx *s_ctx, PetscScalar *dom, PetscInt *mesh) {
              "Error in max_eigen_num_lv1=%d for the level-1 problem.\n",
              s_ctx->max_eigen_num_lv1);
 
-  s_ctx->max_eigen_num_lv2 = 4;
+  s_ctx->max_eigen_num_lv2 = 1;
 
   PetscCall(PetscOptionsGetInt(NULL, NULL, "-en_lv2", &s_ctx->max_eigen_num_lv2,
                                NULL));
@@ -883,7 +903,7 @@ PetscErrorCode PC_init(PCCtx *s_ctx, PetscScalar *dom, PetscInt *mesh) {
   PetscCall(PetscMalloc1(s_ctx->sub_domains, &s_ctx->coarse_lenx));
   PetscCall(PetscMalloc1(s_ctx->sub_domains, &s_ctx->coarse_leny));
   PetscCall(PetscMalloc1(s_ctx->sub_domains, &s_ctx->coarse_lenz));
-  PetscCall(PetscMalloc1(coarse_elem_num, &s_ctx->eigen_num_lv1));
+  // PetscCall(PetscMalloc1(coarse_elem_num, &s_ctx->eigen_num_lv1));
   PetscCall(PetscMalloc1(coarse_elem_num, &s_ctx->eigen_max_lv1));
   PetscCall(PetscMalloc1(coarse_elem_num, &s_ctx->eigen_min_lv1));
 
@@ -894,7 +914,6 @@ PetscErrorCode PC_final(PCCtx *s_ctx) {
   PetscFunctionBeginUser;
   PetscInt i, coarse_elem_num =
                   s_ctx->sub_domains * s_ctx->sub_domains * s_ctx->sub_domains;
-
 
   for (i = 0; i < coarse_elem_num * s_ctx->max_eigen_num_lv1; ++i)
     PetscCall(VecDestroy(&s_ctx->ms_bases_c[i]));
@@ -916,7 +935,7 @@ PetscErrorCode PC_final_default(PCCtx *s_ctx) {
   PetscCall(PetscFree(s_ctx->coarse_lenx));
   PetscCall(PetscFree(s_ctx->coarse_leny));
   PetscCall(PetscFree(s_ctx->coarse_lenz));
-  PetscCall(PetscFree(s_ctx->eigen_num_lv1));
+  // PetscCall(PetscFree(s_ctx->eigen_num_lv1));
   PetscCall(PetscFree(s_ctx->eigen_max_lv1));
   PetscCall(PetscFree(s_ctx->eigen_min_lv1));
 
