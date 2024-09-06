@@ -1,2545 +1,2686 @@
-static char help[] =
-    "Solves the incompressible, variable viscosity stokes equation in 3d using Q1Q1 elements, \n\
-stabilized with Bochev's polynomial projection method. Note that implementation here assumes \n\
-all boundaries are free-slip, i.e. zero normal flow and zero tangential stress \n\
-     -mx : number elements in x-direction \n\
-     -my : number elements in y-direction \n\
-     -mz : number elements in z-direction \n\
-     -stokes_ksp_monitor_blocks : active monitor for each component u,v,w,p \n\
-     -model : defines viscosity and forcing function. Choose either: 0 (isoviscous), 1 (manufactured-broken), 2 (solcx-2d), 3 (sinker), 4 (subdomain jumps) \n";
+static char help[] = "Solves the incompressible, variable-viscosity Stokes "
+                     "equation in 2D or 3D, driven by buoyancy variations.\n"
+                     "-dim: set dimension (2 or 3)\n"
+                     "-nondimensional: replace dimensional domain and "
+                     "coefficients with nondimensional ones\n"
+                     "-isoviscous: use constant viscosity\n"
+                     "-levels: number of grids to create, by coarsening\n"
+                     "-rediscretize: create operators for all grids and set up "
+                     "a FieldSplit/MG solver\n"
+                     "-dump_solution: dump VTK files\n\n";
 
-/* Contributed by Dave May */
-
+#include <petscdm.h>
 #include <petscdmda.h>
+#include <petscdmstag.h>
 #include <petscksp.h>
 
-#define PROFILE_TIMING
-#define ASSEMBLE_LOWER_TRIANGULAR
-
-#define NSD 3          /* number of spatial dimensions */
-#define NODES_PER_EL 8 /* nodes per element */
-#define U_DOFS 3       /* degrees of freedom per velocity node */
-#define P_DOFS 1       /* degrees of freedom per pressure node */
-#define GAUSS_POINTS 8
-
-/* Gauss point based evaluation */
-typedef struct {
-  PetscScalar gp_coords[NSD * GAUSS_POINTS];
-  PetscScalar eta[GAUSS_POINTS];
-  PetscScalar fx[GAUSS_POINTS];
-  PetscScalar fy[GAUSS_POINTS];
-  PetscScalar fz[GAUSS_POINTS];
-  PetscScalar hc[GAUSS_POINTS];
-} GaussPointCoefficients;
-
-typedef struct {
-  PetscScalar u_dof;
-  PetscScalar v_dof;
-  PetscScalar w_dof;
-  PetscScalar p_dof;
-} StokesDOF;
-
-typedef struct _p_CellProperties *CellProperties;
-struct _p_CellProperties {
-  PetscInt ncells;
-  PetscInt mx, my, mz;
-  PetscInt sex, sey, sez;
-  GaussPointCoefficients *gpc;
-};
-
-/* elements */
-PetscErrorCode CellPropertiesCreate(DM da_stokes, CellProperties *C) {
-  CellProperties cells;
-  PetscInt mx, my, mz, sex, sey, sez;
-
-  PetscFunctionBeginUser;
-  PetscCall(PetscNew(&cells));
-
-  PetscCall(DMDAGetElementsCorners(da_stokes, &sex, &sey, &sez));
-  PetscCall(DMDAGetElementsSizes(da_stokes, &mx, &my, &mz));
-  cells->mx = mx;
-  cells->my = my;
-  cells->mz = mz;
-  cells->ncells = mx * my * mz;
-  cells->sex = sex;
-  cells->sey = sey;
-  cells->sez = sez;
-
-  PetscCall(PetscMalloc1(mx * my * mz, &cells->gpc));
-
-  *C = cells;
-  PetscFunctionReturn(PETSC_SUCCESS);
-}
-
-PetscErrorCode CellPropertiesDestroy(CellProperties *C) {
-  CellProperties cells;
-
-  PetscFunctionBeginUser;
-  if (!C)
-    PetscFunctionReturn(PETSC_SUCCESS);
-  cells = *C;
-  PetscCall(PetscFree(cells->gpc));
-  PetscCall(PetscFree(cells));
-  *C = NULL;
-  PetscFunctionReturn(PETSC_SUCCESS);
-}
-
-PetscErrorCode CellPropertiesGetCell(CellProperties C, PetscInt II, PetscInt J,
-                                     PetscInt K, GaussPointCoefficients **G) {
-  PetscFunctionBeginUser;
-  *G = &C->gpc[(II - C->sex) + (J - C->sey) * C->mx +
-               (K - C->sez) * C->mx * C->my];
-  PetscFunctionReturn(PETSC_SUCCESS);
-}
-
-/* FEM routines */
-/*
- Element: Local basis function ordering
- 1-----2
- |     |
- |     |
- 0-----3
- */
-static void ShapeFunctionQ13D_Evaluate(PetscScalar _xi[], PetscScalar Ni[]) {
-  PetscReal xi = PetscRealPart(_xi[0]);
-  PetscReal eta = PetscRealPart(_xi[1]);
-  PetscReal zeta = PetscRealPart(_xi[2]);
-
-  Ni[0] = 0.125 * (1.0 - xi) * (1.0 - eta) * (1.0 - zeta);
-  Ni[1] = 0.125 * (1.0 - xi) * (1.0 + eta) * (1.0 - zeta);
-  Ni[2] = 0.125 * (1.0 + xi) * (1.0 + eta) * (1.0 - zeta);
-  Ni[3] = 0.125 * (1.0 + xi) * (1.0 - eta) * (1.0 - zeta);
-
-  Ni[4] = 0.125 * (1.0 - xi) * (1.0 - eta) * (1.0 + zeta);
-  Ni[5] = 0.125 * (1.0 - xi) * (1.0 + eta) * (1.0 + zeta);
-  Ni[6] = 0.125 * (1.0 + xi) * (1.0 + eta) * (1.0 + zeta);
-  Ni[7] = 0.125 * (1.0 + xi) * (1.0 - eta) * (1.0 + zeta);
-}
-
-static void ShapeFunctionQ13D_Evaluate_dxi(PetscScalar _xi[],
-                                           PetscScalar GNi[][NODES_PER_EL]) {
-  PetscReal xi = PetscRealPart(_xi[0]);
-  PetscReal eta = PetscRealPart(_xi[1]);
-  PetscReal zeta = PetscRealPart(_xi[2]);
-  /* xi deriv */
-  GNi[0][0] = -0.125 * (1.0 - eta) * (1.0 - zeta);
-  GNi[0][1] = -0.125 * (1.0 + eta) * (1.0 - zeta);
-  GNi[0][2] = 0.125 * (1.0 + eta) * (1.0 - zeta);
-  GNi[0][3] = 0.125 * (1.0 - eta) * (1.0 - zeta);
-
-  GNi[0][4] = -0.125 * (1.0 - eta) * (1.0 + zeta);
-  GNi[0][5] = -0.125 * (1.0 + eta) * (1.0 + zeta);
-  GNi[0][6] = 0.125 * (1.0 + eta) * (1.0 + zeta);
-  GNi[0][7] = 0.125 * (1.0 - eta) * (1.0 + zeta);
-  /* eta deriv */
-  GNi[1][0] = -0.125 * (1.0 - xi) * (1.0 - zeta);
-  GNi[1][1] = 0.125 * (1.0 - xi) * (1.0 - zeta);
-  GNi[1][2] = 0.125 * (1.0 + xi) * (1.0 - zeta);
-  GNi[1][3] = -0.125 * (1.0 + xi) * (1.0 - zeta);
-
-  GNi[1][4] = -0.125 * (1.0 - xi) * (1.0 + zeta);
-  GNi[1][5] = 0.125 * (1.0 - xi) * (1.0 + zeta);
-  GNi[1][6] = 0.125 * (1.0 + xi) * (1.0 + zeta);
-  GNi[1][7] = -0.125 * (1.0 + xi) * (1.0 + zeta);
-  /* zeta deriv */
-  GNi[2][0] = -0.125 * (1.0 - xi) * (1.0 - eta);
-  GNi[2][1] = -0.125 * (1.0 - xi) * (1.0 + eta);
-  GNi[2][2] = -0.125 * (1.0 + xi) * (1.0 + eta);
-  GNi[2][3] = -0.125 * (1.0 + xi) * (1.0 - eta);
-
-  GNi[2][4] = 0.125 * (1.0 - xi) * (1.0 - eta);
-  GNi[2][5] = 0.125 * (1.0 - xi) * (1.0 + eta);
-  GNi[2][6] = 0.125 * (1.0 + xi) * (1.0 + eta);
-  GNi[2][7] = 0.125 * (1.0 + xi) * (1.0 - eta);
-}
-
-static void matrix_inverse_3x3(PetscScalar A[3][3], PetscScalar B[3][3]) {
-  PetscScalar t4, t6, t8, t10, t12, t14, t17;
-
-  t4 = A[2][0] * A[0][1];
-  t6 = A[2][0] * A[0][2];
-  t8 = A[1][0] * A[0][1];
-  t10 = A[1][0] * A[0][2];
-  t12 = A[0][0] * A[1][1];
-  t14 = A[0][0] * A[1][2];
-  t17 = 0.1e1 / (t4 * A[1][2] - t6 * A[1][1] - t8 * A[2][2] + t10 * A[2][1] +
-                 t12 * A[2][2] - t14 * A[2][1]);
-
-  B[0][0] = (A[1][1] * A[2][2] - A[1][2] * A[2][1]) * t17;
-  B[0][1] = -(A[0][1] * A[2][2] - A[0][2] * A[2][1]) * t17;
-  B[0][2] = (A[0][1] * A[1][2] - A[0][2] * A[1][1]) * t17;
-  B[1][0] = -(-A[2][0] * A[1][2] + A[1][0] * A[2][2]) * t17;
-  B[1][1] = (-t6 + A[0][0] * A[2][2]) * t17;
-  B[1][2] = -(-t10 + t14) * t17;
-  B[2][0] = (-A[2][0] * A[1][1] + A[1][0] * A[2][1]) * t17;
-  B[2][1] = -(-t4 + A[0][0] * A[2][1]) * t17;
-  B[2][2] = (-t8 + t12) * t17;
-}
-
-static void ShapeFunctionQ13D_Evaluate_dx(PetscScalar GNi[][NODES_PER_EL],
-                                          PetscScalar GNx[][NODES_PER_EL],
-                                          PetscScalar coords[],
-                                          PetscScalar *det_J) {
-  PetscScalar J00, J01, J02, J10, J11, J12, J20, J21, J22;
-  PetscInt n;
-  PetscScalar iJ[3][3], JJ[3][3];
-
-  J00 = J01 = J02 = 0.0;
-  J10 = J11 = J12 = 0.0;
-  J20 = J21 = J22 = 0.0;
-  for (n = 0; n < NODES_PER_EL; n++) {
-    PetscScalar cx = coords[NSD * n + 0];
-    PetscScalar cy = coords[NSD * n + 1];
-    PetscScalar cz = coords[NSD * n + 2];
-
-    /* J_ij = d(x_j) / d(xi_i) */ /* J_ij = \sum _I GNi[j][I} * x_i */
-    J00 = J00 + GNi[0][n] * cx;   /* J_xx */
-    J01 = J01 + GNi[0][n] * cy;   /* J_xy = dx/deta */
-    J02 = J02 + GNi[0][n] * cz;   /* J_xz = dx/dzeta */
-
-    J10 = J10 + GNi[1][n] * cx; /* J_yx = dy/dxi */
-    J11 = J11 + GNi[1][n] * cy; /* J_yy */
-    J12 = J12 + GNi[1][n] * cz; /* J_yz */
-
-    J20 = J20 + GNi[2][n] * cx; /* J_zx */
-    J21 = J21 + GNi[2][n] * cy; /* J_zy */
-    J22 = J22 + GNi[2][n] * cz; /* J_zz */
-  }
-
-  JJ[0][0] = J00;
-  JJ[0][1] = J01;
-  JJ[0][2] = J02;
-  JJ[1][0] = J10;
-  JJ[1][1] = J11;
-  JJ[1][2] = J12;
-  JJ[2][0] = J20;
-  JJ[2][1] = J21;
-  JJ[2][2] = J22;
-
-  matrix_inverse_3x3(JJ, iJ);
-
-  *det_J = J00 * J11 * J22 - J00 * J12 * J21 - J10 * J01 * J22 +
-           J10 * J02 * J21 + J20 * J01 * J12 - J20 * J02 * J11;
-
-  for (n = 0; n < NODES_PER_EL; n++) {
-    GNx[0][n] =
-        GNi[0][n] * iJ[0][0] + GNi[1][n] * iJ[0][1] + GNi[2][n] * iJ[0][2];
-    GNx[1][n] =
-        GNi[0][n] * iJ[1][0] + GNi[1][n] * iJ[1][1] + GNi[2][n] * iJ[1][2];
-    GNx[2][n] =
-        GNi[0][n] * iJ[2][0] + GNi[1][n] * iJ[2][1] + GNi[2][n] * iJ[2][2];
-  }
-}
-
-static void ConstructGaussQuadrature3D(PetscInt *ngp, PetscScalar gp_xi[][NSD],
-                                       PetscScalar gp_weight[]) {
-  *ngp = 8;
-  gp_xi[0][0] = -0.57735026919;
-  gp_xi[0][1] = -0.57735026919;
-  gp_xi[0][2] = -0.57735026919;
-  gp_xi[1][0] = -0.57735026919;
-  gp_xi[1][1] = 0.57735026919;
-  gp_xi[1][2] = -0.57735026919;
-  gp_xi[2][0] = 0.57735026919;
-  gp_xi[2][1] = 0.57735026919;
-  gp_xi[2][2] = -0.57735026919;
-  gp_xi[3][0] = 0.57735026919;
-  gp_xi[3][1] = -0.57735026919;
-  gp_xi[3][2] = -0.57735026919;
-
-  gp_xi[4][0] = -0.57735026919;
-  gp_xi[4][1] = -0.57735026919;
-  gp_xi[4][2] = 0.57735026919;
-  gp_xi[5][0] = -0.57735026919;
-  gp_xi[5][1] = 0.57735026919;
-  gp_xi[5][2] = 0.57735026919;
-  gp_xi[6][0] = 0.57735026919;
-  gp_xi[6][1] = 0.57735026919;
-  gp_xi[6][2] = 0.57735026919;
-  gp_xi[7][0] = 0.57735026919;
-  gp_xi[7][1] = -0.57735026919;
-  gp_xi[7][2] = 0.57735026919;
-
-  gp_weight[0] = 1.0;
-  gp_weight[1] = 1.0;
-  gp_weight[2] = 1.0;
-  gp_weight[3] = 1.0;
-
-  gp_weight[4] = 1.0;
-  gp_weight[5] = 1.0;
-  gp_weight[6] = 1.0;
-  gp_weight[7] = 1.0;
-}
-
-/*
- i,j are the element indices
- The unknown is a vector quantity.
- The s[].c is used to indicate the degree of freedom.
- */
-static PetscErrorCode DMDAGetElementEqnums3D_up(MatStencil s_u[],
-                                                MatStencil s_p[], PetscInt i,
-                                                PetscInt j, PetscInt k) {
-  PetscInt n;
-
-  PetscFunctionBeginUser;
-  /* velocity */
-  n = 0;
-  /* node 0 */
-  s_u[n].i = i;
-  s_u[n].j = j;
-  s_u[n].k = k;
-  s_u[n].c = 0;
-  n++; /* Vx0 */
-  s_u[n].i = i;
-  s_u[n].j = j;
-  s_u[n].k = k;
-  s_u[n].c = 1;
-  n++; /* Vy0 */
-  s_u[n].i = i;
-  s_u[n].j = j;
-  s_u[n].k = k;
-  s_u[n].c = 2;
-  n++; /* Vz0 */
-
-  s_u[n].i = i;
-  s_u[n].j = j + 1;
-  s_u[n].k = k;
-  s_u[n].c = 0;
-  n++;
-  s_u[n].i = i;
-  s_u[n].j = j + 1;
-  s_u[n].k = k;
-  s_u[n].c = 1;
-  n++;
-  s_u[n].i = i;
-  s_u[n].j = j + 1;
-  s_u[n].k = k;
-  s_u[n].c = 2;
-  n++;
-
-  s_u[n].i = i + 1;
-  s_u[n].j = j + 1;
-  s_u[n].k = k;
-  s_u[n].c = 0;
-  n++;
-  s_u[n].i = i + 1;
-  s_u[n].j = j + 1;
-  s_u[n].k = k;
-  s_u[n].c = 1;
-  n++;
-  s_u[n].i = i + 1;
-  s_u[n].j = j + 1;
-  s_u[n].k = k;
-  s_u[n].c = 2;
-  n++;
-
-  s_u[n].i = i + 1;
-  s_u[n].j = j;
-  s_u[n].k = k;
-  s_u[n].c = 0;
-  n++;
-  s_u[n].i = i + 1;
-  s_u[n].j = j;
-  s_u[n].k = k;
-  s_u[n].c = 1;
-  n++;
-  s_u[n].i = i + 1;
-  s_u[n].j = j;
-  s_u[n].k = k;
-  s_u[n].c = 2;
-  n++;
-
-  /* */
-  s_u[n].i = i;
-  s_u[n].j = j;
-  s_u[n].k = k + 1;
-  s_u[n].c = 0;
-  n++; /* Vx4 */
-  s_u[n].i = i;
-  s_u[n].j = j;
-  s_u[n].k = k + 1;
-  s_u[n].c = 1;
-  n++; /* Vy4 */
-  s_u[n].i = i;
-  s_u[n].j = j;
-  s_u[n].k = k + 1;
-  s_u[n].c = 2;
-  n++; /* Vz4 */
-
-  s_u[n].i = i;
-  s_u[n].j = j + 1;
-  s_u[n].k = k + 1;
-  s_u[n].c = 0;
-  n++;
-  s_u[n].i = i;
-  s_u[n].j = j + 1;
-  s_u[n].k = k + 1;
-  s_u[n].c = 1;
-  n++;
-  s_u[n].i = i;
-  s_u[n].j = j + 1;
-  s_u[n].k = k + 1;
-  s_u[n].c = 2;
-  n++;
-
-  s_u[n].i = i + 1;
-  s_u[n].j = j + 1;
-  s_u[n].k = k + 1;
-  s_u[n].c = 0;
-  n++;
-  s_u[n].i = i + 1;
-  s_u[n].j = j + 1;
-  s_u[n].k = k + 1;
-  s_u[n].c = 1;
-  n++;
-  s_u[n].i = i + 1;
-  s_u[n].j = j + 1;
-  s_u[n].k = k + 1;
-  s_u[n].c = 2;
-  n++;
-
-  s_u[n].i = i + 1;
-  s_u[n].j = j;
-  s_u[n].k = k + 1;
-  s_u[n].c = 0;
-  n++;
-  s_u[n].i = i + 1;
-  s_u[n].j = j;
-  s_u[n].k = k + 1;
-  s_u[n].c = 1;
-  n++;
-  s_u[n].i = i + 1;
-  s_u[n].j = j;
-  s_u[n].k = k + 1;
-  s_u[n].c = 2;
-  n++;
-
-  /* pressure */
-  n = 0;
-
-  s_p[n].i = i;
-  s_p[n].j = j;
-  s_p[n].k = k;
-  s_p[n].c = 3;
-  n++; /* P0 */
-  s_p[n].i = i;
-  s_p[n].j = j + 1;
-  s_p[n].k = k;
-  s_p[n].c = 3;
-  n++;
-  s_p[n].i = i + 1;
-  s_p[n].j = j + 1;
-  s_p[n].k = k;
-  s_p[n].c = 3;
-  n++;
-  s_p[n].i = i + 1;
-  s_p[n].j = j;
-  s_p[n].k = k;
-  s_p[n].c = 3;
-  n++;
-
-  s_p[n].i = i;
-  s_p[n].j = j;
-  s_p[n].k = k + 1;
-  s_p[n].c = 3;
-  n++; /* P0 */
-  s_p[n].i = i;
-  s_p[n].j = j + 1;
-  s_p[n].k = k + 1;
-  s_p[n].c = 3;
-  n++;
-  s_p[n].i = i + 1;
-  s_p[n].j = j + 1;
-  s_p[n].k = k + 1;
-  s_p[n].c = 3;
-  n++;
-  s_p[n].i = i + 1;
-  s_p[n].j = j;
-  s_p[n].k = k + 1;
-  s_p[n].c = 3;
-  n++;
-  PetscFunctionReturn(PETSC_SUCCESS);
-}
-
-static PetscErrorCode GetElementCoords3D(DMDACoor3d ***coords, PetscInt i,
-                                         PetscInt j, PetscInt k,
-                                         PetscScalar el_coord[]) {
-  PetscFunctionBeginUser;
-  /* get coords for the element */
-  el_coord[0] = coords[k][j][i].x;
-  el_coord[1] = coords[k][j][i].y;
-  el_coord[2] = coords[k][j][i].z;
-
-  el_coord[3] = coords[k][j + 1][i].x;
-  el_coord[4] = coords[k][j + 1][i].y;
-  el_coord[5] = coords[k][j + 1][i].z;
-
-  el_coord[6] = coords[k][j + 1][i + 1].x;
-  el_coord[7] = coords[k][j + 1][i + 1].y;
-  el_coord[8] = coords[k][j + 1][i + 1].z;
-
-  el_coord[9] = coords[k][j][i + 1].x;
-  el_coord[10] = coords[k][j][i + 1].y;
-  el_coord[11] = coords[k][j][i + 1].z;
-
-  el_coord[12] = coords[k + 1][j][i].x;
-  el_coord[13] = coords[k + 1][j][i].y;
-  el_coord[14] = coords[k + 1][j][i].z;
-
-  el_coord[15] = coords[k + 1][j + 1][i].x;
-  el_coord[16] = coords[k + 1][j + 1][i].y;
-  el_coord[17] = coords[k + 1][j + 1][i].z;
-
-  el_coord[18] = coords[k + 1][j + 1][i + 1].x;
-  el_coord[19] = coords[k + 1][j + 1][i + 1].y;
-  el_coord[20] = coords[k + 1][j + 1][i + 1].z;
-
-  el_coord[21] = coords[k + 1][j][i + 1].x;
-  el_coord[22] = coords[k + 1][j][i + 1].y;
-  el_coord[23] = coords[k + 1][j][i + 1].z;
-  PetscFunctionReturn(PETSC_SUCCESS);
-}
-
-static PetscErrorCode StokesDAGetNodalFields3D(StokesDOF ***field, PetscInt i,
-                                               PetscInt j, PetscInt k,
-                                               StokesDOF nodal_fields[]) {
-  PetscFunctionBeginUser;
-  /* get the nodal fields for u */
-  nodal_fields[0].u_dof = field[k][j][i].u_dof;
-  nodal_fields[0].v_dof = field[k][j][i].v_dof;
-  nodal_fields[0].w_dof = field[k][j][i].w_dof;
-
-  nodal_fields[1].u_dof = field[k][j + 1][i].u_dof;
-  nodal_fields[1].v_dof = field[k][j + 1][i].v_dof;
-  nodal_fields[1].w_dof = field[k][j + 1][i].w_dof;
-
-  nodal_fields[2].u_dof = field[k][j + 1][i + 1].u_dof;
-  nodal_fields[2].v_dof = field[k][j + 1][i + 1].v_dof;
-  nodal_fields[2].w_dof = field[k][j + 1][i + 1].w_dof;
-
-  nodal_fields[3].u_dof = field[k][j][i + 1].u_dof;
-  nodal_fields[3].v_dof = field[k][j][i + 1].v_dof;
-  nodal_fields[3].w_dof = field[k][j][i + 1].w_dof;
-
-  nodal_fields[4].u_dof = field[k + 1][j][i].u_dof;
-  nodal_fields[4].v_dof = field[k + 1][j][i].v_dof;
-  nodal_fields[4].w_dof = field[k + 1][j][i].w_dof;
-
-  nodal_fields[5].u_dof = field[k + 1][j + 1][i].u_dof;
-  nodal_fields[5].v_dof = field[k + 1][j + 1][i].v_dof;
-  nodal_fields[5].w_dof = field[k + 1][j + 1][i].w_dof;
-
-  nodal_fields[6].u_dof = field[k + 1][j + 1][i + 1].u_dof;
-  nodal_fields[6].v_dof = field[k + 1][j + 1][i + 1].v_dof;
-  nodal_fields[6].w_dof = field[k + 1][j + 1][i + 1].w_dof;
-
-  nodal_fields[7].u_dof = field[k + 1][j][i + 1].u_dof;
-  nodal_fields[7].v_dof = field[k + 1][j][i + 1].v_dof;
-  nodal_fields[7].w_dof = field[k + 1][j][i + 1].w_dof;
-
-  /* get the nodal fields for p */
-  nodal_fields[0].p_dof = field[k][j][i].p_dof;
-  nodal_fields[1].p_dof = field[k][j + 1][i].p_dof;
-  nodal_fields[2].p_dof = field[k][j + 1][i + 1].p_dof;
-  nodal_fields[3].p_dof = field[k][j][i + 1].p_dof;
-
-  nodal_fields[4].p_dof = field[k + 1][j][i].p_dof;
-  nodal_fields[5].p_dof = field[k + 1][j + 1][i].p_dof;
-  nodal_fields[6].p_dof = field[k + 1][j + 1][i + 1].p_dof;
-  nodal_fields[7].p_dof = field[k + 1][j][i + 1].p_dof;
-  PetscFunctionReturn(PETSC_SUCCESS);
-}
-
-static PetscInt ASS_MAP_wIwDI_uJuDJ(PetscInt wi, PetscInt wd, PetscInt w_NPE,
-                                    PetscInt w_dof, PetscInt ui, PetscInt ud,
-                                    PetscInt u_NPE, PetscInt u_dof) {
-  PetscInt ij;
-  PETSC_UNUSED PetscInt r, c, nr, nc;
-
-  nr = w_NPE * w_dof;
-  nc = u_NPE * u_dof;
-
-  r = w_dof * wi + wd;
-  c = u_dof * ui + ud;
-
-  ij = r * nc + c;
-
-  return ij;
-}
-
+/* Application context - grid-based data*/
+typedef struct LevelCtxData_ {
+  DM dm_stokes, dm_coefficients, dm_faces;
+  Vec coeff;
+  PetscInt cells_x, cells_y, cells_z; /* redundant with DMs */
+  PetscReal hx_characteristic, hy_characteristic, hz_characteristic;
+  PetscScalar K_bound, K_cont;
+} LevelCtxData;
+typedef LevelCtxData *LevelCtx;
+
+/* Application context - problem and grid(s) (but not solver-specific data) */
+typedef struct CtxData_ {
+  MPI_Comm comm;
+  PetscInt dim;                       /* redundant with DMs */
+  PetscInt cells_x, cells_y, cells_z; /* Redundant with finest DMs */
+  PetscReal xmax, ymax, xmin, ymin, zmin, zmax;
+  PetscScalar eta1, eta2, rho1, rho2, gy, eta_characteristic;
+  PetscBool pin_pressure;
+  PetscScalar (*GetEta)(struct CtxData_ *, PetscScalar, PetscScalar,
+                        PetscScalar);
+  PetscScalar (*GetRho)(struct CtxData_ *, PetscScalar, PetscScalar,
+                        PetscScalar);
+  PetscInt n_levels;
+  LevelCtx *levels;
+} CtxData;
+typedef CtxData *Ctx;
+
+/* Helper to pass system-creation parameters */
+typedef struct SystemParameters_ {
+  Ctx ctx;
+  PetscInt level;
+  PetscBool include_inverse_visc, faces_only;
+} SystemParametersData;
+typedef SystemParametersData *SystemParameters;
+
+/* Main logic */
+static PetscErrorCode AttachNullspace(DM, Mat);
+static PetscErrorCode CreateAuxiliaryOperator(Ctx, PetscInt, Mat *);
+static PetscErrorCode CreateSystem(SystemParameters, Mat *, Vec *);
+static PetscErrorCode CtxCreateAndSetFromOptions(Ctx *);
+static PetscErrorCode CtxDestroy(Ctx *);
+static PetscErrorCode DumpSolution(Ctx, PetscInt, Vec);
 static PetscErrorCode
-DMDASetValuesLocalStencil3D_ADD_VALUES(StokesDOF ***fields_F,
-                                       MatStencil u_eqn[], MatStencil p_eqn[],
-                                       PetscScalar Fe_u[], PetscScalar Fe_p[]) {
-  PetscInt n, II, J, K;
+    OperatorInsertInverseViscosityPressureTerms(DM, DM, Vec, PetscScalar, Mat);
+static PetscErrorCode PopulateCoefficientData(Ctx, PetscInt);
+static PetscErrorCode SystemParametersCreate(SystemParameters *, Ctx);
+static PetscErrorCode SystemParametersDestroy(SystemParameters *);
+
+int main(int argc, char **argv) {
+  Ctx ctx;
+  Mat A, *A_faces = NULL, S_hat = NULL, P = NULL;
+  Vec x, b;
+  KSP ksp;
+  DM dm_stokes, dm_coefficients;
+  PetscBool dump_solution, build_auxiliary_operator, rediscretize,
+      custom_pc_mat;
 
   PetscFunctionBeginUser;
-  for (n = 0; n < NODES_PER_EL; n++) {
-    II = u_eqn[NSD * n].i;
-    J = u_eqn[NSD * n].j;
-    K = u_eqn[NSD * n].k;
+  PetscCall(PetscInitialize(&argc, &argv, (char *)0, help));
 
-    fields_F[K][J][II].u_dof = fields_F[K][J][II].u_dof + Fe_u[NSD * n];
+  /* Accept options for program behavior */
+  dump_solution = PETSC_FALSE;
+  PetscCall(
+      PetscOptionsGetBool(NULL, NULL, "-dump_solution", &dump_solution, NULL));
+  rediscretize = PETSC_FALSE;
+  PetscCall(
+      PetscOptionsGetBool(NULL, NULL, "-rediscretize", &rediscretize, NULL));
+  build_auxiliary_operator = rediscretize;
+  PetscCall(PetscOptionsGetBool(NULL, NULL, "-build_auxiliary_operator",
+                                &build_auxiliary_operator, NULL));
+  custom_pc_mat = PETSC_FALSE;
+  PetscCall(
+      PetscOptionsGetBool(NULL, NULL, "-custom_pc_mat", &custom_pc_mat, NULL));
 
-    II = u_eqn[NSD * n + 1].i;
-    J = u_eqn[NSD * n + 1].j;
-    K = u_eqn[NSD * n + 1].k;
+  /* Populate application context */
+  PetscCall(CtxCreateAndSetFromOptions(&ctx));
 
-    fields_F[K][J][II].v_dof = fields_F[K][J][II].v_dof + Fe_u[NSD * n + 1];
+  /* Create two DMStag objects, corresponding to the same domain and parallel
+     decomposition ("topology"). Each defines a different set of fields on
+     the domain ("section"); the first the solution to the Stokes equations
+     (x- and y-velocities and scalar pressure), and the second holds
+     coefficients (viscosities on elements and viscosities+densities on
+     corners/edges in 2d/3d) */
+  if (ctx->dim == 2) {
+    PetscCall(DMStagCreate2d(
+        ctx->comm, DM_BOUNDARY_NONE, DM_BOUNDARY_NONE, ctx->cells_x,
+        ctx->cells_y, /* Global element counts */
+        PETSC_DECIDE,
+        PETSC_DECIDE, /* Determine parallel decomposition automatically */
+        0, 1, 1,      /* dof: 0 per vertex, 1 per edge, 1 per face/element */
+        DMSTAG_STENCIL_BOX, 1, /* elementwise stencil width */
+        NULL, NULL, &ctx->levels[ctx->n_levels - 1]->dm_stokes));
+  } else if (ctx->dim == 3) {
+    PetscCall(DMStagCreate3d(
+        ctx->comm, DM_BOUNDARY_NONE, DM_BOUNDARY_NONE, DM_BOUNDARY_NONE,
+        ctx->cells_x, ctx->cells_y, ctx->cells_z, PETSC_DECIDE, PETSC_DECIDE,
+        PETSC_DECIDE, 0, 0, 1, 1, /* dof: 1 per face, 1 per element */
+        DMSTAG_STENCIL_BOX, 1, NULL, NULL, NULL,
+        &ctx->levels[ctx->n_levels - 1]->dm_stokes));
+  } else
+    SETERRQ(PETSC_COMM_WORLD, PETSC_ERR_SUP,
+            "Unsupported dimension: %" PetscInt_FMT, ctx->dim);
+  dm_stokes = ctx->levels[ctx->n_levels - 1]->dm_stokes;
+  PetscCall(DMSetFromOptions(dm_stokes));
+  PetscCall(DMStagGetGlobalSizes(dm_stokes, &ctx->cells_x, &ctx->cells_y,
+                                 &ctx->cells_z));
+  PetscCall(DMSetUp(dm_stokes));
+  PetscCall(DMStagSetUniformCoordinatesProduct(dm_stokes, ctx->xmin, ctx->xmax,
+                                               ctx->ymin, ctx->ymax, ctx->zmin,
+                                               ctx->zmax));
 
-    II = u_eqn[NSD * n + 2].i;
-    J = u_eqn[NSD * n + 2].j;
-    K = u_eqn[NSD * n + 2].k;
-    fields_F[K][J][II].w_dof = fields_F[K][J][II].w_dof + Fe_u[NSD * n + 2];
+  if (ctx->dim == 2)
+    PetscCall(DMStagCreateCompatibleDMStag(
+        dm_stokes, 2, 0, 1, 0,
+        &ctx->levels[ctx->n_levels - 1]->dm_coefficients));
+  else if (ctx->dim == 3)
+    PetscCall(DMStagCreateCompatibleDMStag(
+        dm_stokes, 0, 2, 0, 1,
+        &ctx->levels[ctx->n_levels - 1]->dm_coefficients));
+  else
+    SETERRQ(PETSC_COMM_WORLD, PETSC_ERR_SUP,
+            "Unsupported dimension: %" PetscInt_FMT, ctx->dim);
+  dm_coefficients = ctx->levels[ctx->n_levels - 1]->dm_coefficients;
+  PetscCall(DMSetUp(dm_coefficients));
+  PetscCall(DMStagSetUniformCoordinatesProduct(dm_coefficients, ctx->xmin,
+                                               ctx->xmax, ctx->ymin, ctx->ymax,
+                                               ctx->zmin, ctx->zmax));
 
-    II = p_eqn[n].i;
-    J = p_eqn[n].j;
-    K = p_eqn[n].k;
-
-    fields_F[K][J][II].p_dof = fields_F[K][J][II].p_dof + Fe_p[n];
+  /* Create additional DMs by coarsening. 0 is the coarsest level */
+  for (PetscInt level = ctx->n_levels - 1; level > 0; --level) {
+    PetscCall(DMCoarsen(ctx->levels[level]->dm_stokes, MPI_COMM_NULL,
+                        &ctx->levels[level - 1]->dm_stokes));
+    PetscCall(DMCoarsen(ctx->levels[level]->dm_coefficients, MPI_COMM_NULL,
+                        &ctx->levels[level - 1]->dm_coefficients));
   }
-  PetscFunctionReturn(PETSC_SUCCESS);
-}
 
-static void FormStressOperatorQ13D(PetscScalar Ke[], PetscScalar coords[],
-                                   PetscScalar eta[]) {
-  PetscInt ngp;
-  PetscScalar gp_xi[GAUSS_POINTS][NSD];
-  PetscScalar gp_weight[GAUSS_POINTS];
-  PetscInt p, i, j, k;
-  PetscScalar GNi_p[NSD][NODES_PER_EL], GNx_p[NSD][NODES_PER_EL];
-  PetscScalar J_p, tildeD[6];
-  PetscScalar B[6][U_DOFS * NODES_PER_EL];
-  const PetscInt nvdof = U_DOFS * NODES_PER_EL;
+  /* Compute scaling constants, knowing grid spacing */
+  ctx->eta_characteristic =
+      PetscMin(PetscRealPart(ctx->eta1), PetscRealPart(ctx->eta2));
+  for (PetscInt level = 0; level < ctx->n_levels; ++level) {
+    PetscInt N[3];
+    PetscReal hx_avg_inv;
 
-  /* define quadrature rule */
-  ConstructGaussQuadrature3D(&ngp, gp_xi, gp_weight);
+    PetscCall(DMStagGetGlobalSizes(ctx->levels[level]->dm_stokes, &N[0], &N[1],
+                                   &N[2]));
+    ctx->levels[level]->hx_characteristic = (ctx->xmax - ctx->xmin) / N[0];
+    ctx->levels[level]->hy_characteristic = (ctx->ymax - ctx->ymin) / N[1];
+    if (N[2])
+      ctx->levels[level]->hz_characteristic = (ctx->zmax - ctx->zmin) / N[2];
+    if (ctx->dim == 2) {
+      hx_avg_inv = 2.0 / (ctx->levels[level]->hx_characteristic +
+                          ctx->levels[level]->hy_characteristic);
+    } else if (ctx->dim == 3) {
+      hx_avg_inv = 3.0 / (ctx->levels[level]->hx_characteristic +
+                          ctx->levels[level]->hy_characteristic +
+                          ctx->levels[level]->hz_characteristic);
+    } else
+      SETERRQ(PETSC_COMM_WORLD, PETSC_ERR_SUP,
+              "Not Implemented for dimension %" PetscInt_FMT, ctx->dim);
+    ctx->levels[level]->K_cont = ctx->eta_characteristic * hx_avg_inv;
+    ctx->levels[level]->K_bound =
+        ctx->eta_characteristic * hx_avg_inv * hx_avg_inv;
+  }
 
-  /* evaluate integral */
-  for (p = 0; p < ngp; p++) {
-    ShapeFunctionQ13D_Evaluate_dxi(gp_xi[p], GNi_p);
-    ShapeFunctionQ13D_Evaluate_dx(GNi_p, GNx_p, coords, &J_p);
+  /* Populate coefficient data */
+  for (PetscInt level = 0; level < ctx->n_levels; ++level)
+    PetscCall(PopulateCoefficientData(ctx, level));
 
-    for (i = 0; i < NODES_PER_EL; i++) {
-      PetscScalar d_dx_i = GNx_p[0][i];
-      PetscScalar d_dy_i = GNx_p[1][i];
-      PetscScalar d_dz_i = GNx_p[2][i];
+  /* Construct main system */
+  {
+    SystemParameters system_parameters;
 
-      B[0][3 * i] = d_dx_i;
-      B[0][3 * i + 1] = 0.0;
-      B[0][3 * i + 2] = 0.0;
-      B[1][3 * i] = 0.0;
-      B[1][3 * i + 1] = d_dy_i;
-      B[1][3 * i + 2] = 0.0;
-      B[2][3 * i] = 0.0;
-      B[2][3 * i + 1] = 0.0;
-      B[2][3 * i + 2] = d_dz_i;
+    PetscCall(SystemParametersCreate(&system_parameters, ctx));
+    PetscCall(CreateSystem(system_parameters, &A, &b));
+    PetscCall(SystemParametersDestroy(&system_parameters));
+  }
 
-      B[3][3 * i] = d_dy_i;
-      B[3][3 * i + 1] = d_dx_i;
-      B[3][3 * i + 2] = 0.0; /* e_xy */
-      B[4][3 * i] = d_dz_i;
-      B[4][3 * i + 1] = 0.0;
-      B[4][3 * i + 2] = d_dx_i; /* e_xz */
-      B[5][3 * i] = 0.0;
-      B[5][3 * i + 1] = d_dz_i;
-      B[5][3 * i + 2] = d_dy_i; /* e_yz */
+  /* Attach a constant-pressure nullspace to the fine-level operator */
+  if (!ctx->pin_pressure)
+    PetscCall(AttachNullspace(dm_stokes, A));
+
+  /* Set up solver */
+  PetscCall(KSPCreate(ctx->comm, &ksp));
+  PetscCall(KSPSetType(ksp, KSPFGMRES));
+  {
+    /* Default to a direct solver, if a package is available */
+    PetscMPIInt size;
+
+    PetscCallMPI(MPI_Comm_size(ctx->comm, &size));
+    if (PetscDefined(HAVE_SUITESPARSE) && size == 1) {
+      PC pc;
+
+      PetscCall(KSPGetPC(ksp, &pc));
+      PetscCall(PCSetType(pc, PCLU));
+      PetscCall(PCFactorSetMatSolverType(
+          pc, MATSOLVERUMFPACK)); /* A default, requires SuiteSparse */
     }
+    if (PetscDefined(HAVE_MUMPS) && size > 1) {
+      PC pc;
 
-    tildeD[0] = 2.0 * gp_weight[p] * J_p * eta[p];
-    tildeD[1] = 2.0 * gp_weight[p] * J_p * eta[p];
-    tildeD[2] = 2.0 * gp_weight[p] * J_p * eta[p];
-
-    tildeD[3] = gp_weight[p] * J_p * eta[p];
-    tildeD[4] = gp_weight[p] * J_p * eta[p];
-    tildeD[5] = gp_weight[p] * J_p * eta[p];
-
-    /* form Bt tildeD B */
-    /*
-     Ke_ij = Bt_ik . D_kl . B_lj
-     = B_ki . D_kl . B_lj
-     = B_ki . D_kk . B_kj
-     */
-    for (i = 0; i < nvdof; i++) {
-      for (j = i; j < nvdof; j++) {
-        for (k = 0; k < 6; k++)
-          Ke[i * nvdof + j] += B[k][i] * tildeD[k] * B[k][j];
-      }
-    }
-  }
-  /* fill lower triangular part */
-#if defined(ASSEMBLE_LOWER_TRIANGULAR)
-  for (i = 0; i < nvdof; i++) {
-    for (j = i; j < nvdof; j++)
-      Ke[j * nvdof + i] = Ke[i * nvdof + j];
-  }
-#endif
-}
-
-static void FormGradientOperatorQ13D(PetscScalar Ke[], PetscScalar coords[]) {
-  PetscInt ngp;
-  PetscScalar gp_xi[GAUSS_POINTS][NSD];
-  PetscScalar gp_weight[GAUSS_POINTS];
-  PetscInt p, i, j, di;
-  PetscScalar Ni_p[NODES_PER_EL];
-  PetscScalar GNi_p[NSD][NODES_PER_EL], GNx_p[NSD][NODES_PER_EL];
-  PetscScalar J_p, fac;
-
-  /* define quadrature rule */
-  ConstructGaussQuadrature3D(&ngp, gp_xi, gp_weight);
-
-  /* evaluate integral */
-  for (p = 0; p < ngp; p++) {
-    ShapeFunctionQ13D_Evaluate(gp_xi[p], Ni_p);
-    ShapeFunctionQ13D_Evaluate_dxi(gp_xi[p], GNi_p);
-    ShapeFunctionQ13D_Evaluate_dx(GNi_p, GNx_p, coords, &J_p);
-    fac = gp_weight[p] * J_p;
-
-    for (i = 0; i < NODES_PER_EL; i++) { /* u nodes */
-      for (di = 0; di < NSD; di++) {     /* u dofs */
-        for (j = 0; j < NODES_PER_EL;
-             j++) { /* p nodes, p dofs = 1 (ie no loop) */
-          PetscInt IJ;
-          IJ = ASS_MAP_wIwDI_uJuDJ(i, di, NODES_PER_EL, 3, j, 0, NODES_PER_EL,
-                                   1);
-
-          Ke[IJ] = Ke[IJ] - GNx_p[di][i] * Ni_p[j] * fac;
-        }
-      }
-    }
-  }
-}
-
-static void FormDivergenceOperatorQ13D(PetscScalar De[], PetscScalar coords[]) {
-  PetscScalar Ge[U_DOFS * NODES_PER_EL * P_DOFS * NODES_PER_EL];
-  PetscInt i, j;
-  PetscInt nr_g, nc_g;
-
-  PetscCallAbort(PETSC_COMM_SELF, PetscMemzero(Ge, sizeof(Ge)));
-  FormGradientOperatorQ13D(Ge, coords);
-
-  nr_g = U_DOFS * NODES_PER_EL;
-  nc_g = P_DOFS * NODES_PER_EL;
-
-  for (i = 0; i < nr_g; i++) {
-    for (j = 0; j < nc_g; j++)
-      De[nr_g * j + i] = Ge[nc_g * i + j];
-  }
-}
-
-static void FormStabilisationOperatorQ13D(PetscScalar Ke[],
-                                          PetscScalar coords[],
-                                          PetscScalar eta[]) {
-  PetscInt ngp;
-  PetscScalar gp_xi[GAUSS_POINTS][NSD];
-  PetscScalar gp_weight[GAUSS_POINTS];
-  PetscInt p, i, j;
-  PetscScalar Ni_p[NODES_PER_EL];
-  PetscScalar GNi_p[NSD][NODES_PER_EL], GNx_p[NSD][NODES_PER_EL];
-  PetscScalar J_p, fac, eta_avg;
-
-  /* define quadrature rule */
-  ConstructGaussQuadrature3D(&ngp, gp_xi, gp_weight);
-
-  /* evaluate integral */
-  for (p = 0; p < ngp; p++) {
-    ShapeFunctionQ13D_Evaluate(gp_xi[p], Ni_p);
-    ShapeFunctionQ13D_Evaluate_dxi(gp_xi[p], GNi_p);
-    ShapeFunctionQ13D_Evaluate_dx(GNi_p, GNx_p, coords, &J_p);
-    fac = gp_weight[p] * J_p;
-    /*
-     for (i = 0; i < NODES_PER_EL; i++) {
-     for (j = i; j < NODES_PER_EL; j++) {
-     Ke[NODES_PER_EL*i+j] -= fac*(Ni_p[i]*Ni_p[j]-0.015625);
-     }
-     }
-     */
-
-    for (i = 0; i < NODES_PER_EL; i++) {
-      for (j = 0; j < NODES_PER_EL; j++)
-        Ke[NODES_PER_EL * i + j] -= fac * (Ni_p[i] * Ni_p[j] - 0.015625);
+      PetscCall(KSPGetPC(ksp, &pc));
+      PetscCall(PCSetType(pc, PCLU));
+      PetscCall(PCFactorSetMatSolverType(
+          pc, MATSOLVERMUMPS)); /* A default, requires MUMPS */
     }
   }
 
-  /* scale */
-  eta_avg = 0.0;
-  for (p = 0; p < ngp; p++)
-    eta_avg += eta[p];
-  eta_avg = (1.0 / ((PetscScalar)ngp)) * eta_avg;
-  fac = 1.0 / eta_avg;
+  /* Create and set a custom preconditioning matrix */
+  if (custom_pc_mat) {
+    SystemParameters system_parameters;
 
-  /*
-   for (i = 0; i < NODES_PER_EL; i++) {
-   for (j = i; j < NODES_PER_EL; j++) {
-   Ke[NODES_PER_EL*i+j] = fac*Ke[NODES_PER_EL*i+j];
-   #if defined(ASSEMBLE_LOWER_TRIANGULAR)
-   Ke[NODES_PER_EL*j+i] = Ke[NODES_PER_EL*i+j];
-   #endif
-   }
-   }
+    PetscCall(SystemParametersCreate(&system_parameters, ctx));
+    system_parameters->include_inverse_visc = PETSC_TRUE;
+    PetscCall(CreateSystem(system_parameters, &P, NULL));
+    PetscCall(SystemParametersDestroy(&system_parameters));
+    PetscCall(KSPSetOperators(ksp, A, P));
+  } else {
+    PetscCall(KSPSetOperators(ksp, A, A));
+  }
+
+  PetscCall(KSPSetDM(ksp, dm_stokes));
+  PetscCall(KSPSetDMActive(ksp, PETSC_FALSE));
+
+  /* Finish setting up solver (can override options set above) */
+  PetscCall(KSPSetFromOptions(ksp));
+
+  /* Additional solver configuration that can involve setting up and CANNOT be
+     overridden from the command line */
+
+  /* Construct an auxiliary operator for use a Schur complement preconditioner,
+     and tell PCFieldSplit to use it (which has no effect if not using that PC)
    */
+  if (build_auxiliary_operator && !rediscretize) {
+    PC pc;
 
-  for (i = 0; i < NODES_PER_EL; i++) {
-    for (j = 0; j < NODES_PER_EL; j++)
-      Ke[NODES_PER_EL * i + j] = fac * Ke[NODES_PER_EL * i + j];
+    PetscCall(KSPGetPC(ksp, &pc));
+    PetscCall(CreateAuxiliaryOperator(ctx, ctx->n_levels - 1, &S_hat));
+    PetscCall(PCFieldSplitSetSchurPre(pc, PC_FIELDSPLIT_SCHUR_PRE_USER, S_hat));
+    PetscCall(KSPSetFromOptions(ksp));
   }
-}
 
-static void FormScaledMassMatrixOperatorQ13D(PetscScalar Ke[],
-                                             PetscScalar coords[],
-                                             PetscScalar eta[]) {
-  PetscInt ngp;
-  PetscScalar gp_xi[GAUSS_POINTS][NSD];
-  PetscScalar gp_weight[GAUSS_POINTS];
-  PetscInt p, i, j;
-  PetscScalar Ni_p[NODES_PER_EL];
-  PetscScalar GNi_p[NSD][NODES_PER_EL], GNx_p[NSD][NODES_PER_EL];
-  PetscScalar J_p, fac, eta_avg;
+  if (rediscretize) {
+    /* Set up an ABF solver with rediscretized geometric multigrid on the
+     * velocity-velocity block */
+    PC pc, pc_faces;
+    KSP ksp_faces;
 
-  /* define quadrature rule */
-  ConstructGaussQuadrature3D(&ngp, gp_xi, gp_weight);
+    if (ctx->n_levels < 2)
+      PetscCall(
+          PetscPrintf(ctx->comm, "Warning: not using multiple levels!\n"));
 
-  /* evaluate integral */
-  for (p = 0; p < ngp; p++) {
-    ShapeFunctionQ13D_Evaluate(gp_xi[p], Ni_p);
-    ShapeFunctionQ13D_Evaluate_dxi(gp_xi[p], GNi_p);
-    ShapeFunctionQ13D_Evaluate_dx(GNi_p, GNx_p, coords, &J_p);
-    fac = gp_weight[p] * J_p;
-
-    /*
-     for (i = 0; i < NODES_PER_EL; i++) {
-     for (j = i; j < NODES_PER_EL; j++) {
-     Ke[NODES_PER_EL*i+j] = Ke[NODES_PER_EL*i+j]-fac*Ni_p[i]*Ni_p[j];
-     }
-     }
-     */
-
-    for (i = 0; i < NODES_PER_EL; i++) {
-      for (j = 0; j < NODES_PER_EL; j++)
-        Ke[NODES_PER_EL * i + j] =
-            Ke[NODES_PER_EL * i + j] - fac * Ni_p[i] * Ni_p[j];
+    PetscCall(KSPGetPC(ksp, &pc));
+    PetscCall(PCSetType(pc, PCFIELDSPLIT));
+    PetscCall(PCFieldSplitSetType(pc, PC_COMPOSITE_SCHUR));
+    PetscCall(PCFieldSplitSetSchurFactType(pc, PC_FIELDSPLIT_SCHUR_FACT_UPPER));
+    if (build_auxiliary_operator) {
+      PetscCall(CreateAuxiliaryOperator(ctx, ctx->n_levels - 1, &S_hat));
+      PetscCall(
+          PCFieldSplitSetSchurPre(pc, PC_FIELDSPLIT_SCHUR_PRE_USER, S_hat));
     }
-  }
 
-  /* scale */
-  eta_avg = 0.0;
-  for (p = 0; p < ngp; p++)
-    eta_avg += eta[p];
-  eta_avg = (1.0 / ((PetscScalar)ngp)) * eta_avg;
-  fac = 1.0 / eta_avg;
-  /*
-   for (i = 0; i < NODES_PER_EL; i++) {
-   for (j = i; j < NODES_PER_EL; j++) {
-   Ke[NODES_PER_EL*i+j] = fac*Ke[NODES_PER_EL*i+j];
-   #if defined(ASSEMBLE_LOWER_TRIANGULAR)
-   Ke[NODES_PER_EL*j+i] = Ke[NODES_PER_EL*i+j];
-   #endif
-   }
-   }
-   */
+    /* Create rediscretized velocity-only DMs and operators */
+    PetscCall(PetscMalloc1(ctx->n_levels, &A_faces));
+    for (PetscInt level = 0; level < ctx->n_levels; ++level) {
+      if (ctx->dim == 2) {
+        PetscCall(DMStagCreateCompatibleDMStag(ctx->levels[level]->dm_stokes, 0,
+                                               1, 0, 0,
+                                               &ctx->levels[level]->dm_faces));
+      } else if (ctx->dim == 3) {
+        PetscCall(DMStagCreateCompatibleDMStag(ctx->levels[level]->dm_stokes, 0,
+                                               0, 1, 0,
+                                               &ctx->levels[level]->dm_faces));
+      } else
+        SETERRQ(PETSC_COMM_WORLD, PETSC_ERR_SUP,
+                "Not Implemented for dimension %" PetscInt_FMT, ctx->dim);
+      {
+        SystemParameters system_parameters;
 
-  for (i = 0; i < NODES_PER_EL; i++) {
-    for (j = 0; j < NODES_PER_EL; j++)
-      Ke[NODES_PER_EL * i + j] = fac * Ke[NODES_PER_EL * i + j];
-  }
-}
-
-static void FormMomentumRhsQ13D(PetscScalar Fe[], PetscScalar coords[],
-                                PetscScalar fx[], PetscScalar fy[],
-                                PetscScalar fz[]) {
-  PetscInt ngp;
-  PetscScalar gp_xi[GAUSS_POINTS][NSD];
-  PetscScalar gp_weight[GAUSS_POINTS];
-  PetscInt p, i;
-  PetscScalar Ni_p[NODES_PER_EL];
-  PetscScalar GNi_p[NSD][NODES_PER_EL], GNx_p[NSD][NODES_PER_EL];
-  PetscScalar J_p, fac;
-
-  /* define quadrature rule */
-  ConstructGaussQuadrature3D(&ngp, gp_xi, gp_weight);
-
-  /* evaluate integral */
-  for (p = 0; p < ngp; p++) {
-    ShapeFunctionQ13D_Evaluate(gp_xi[p], Ni_p);
-    ShapeFunctionQ13D_Evaluate_dxi(gp_xi[p], GNi_p);
-    ShapeFunctionQ13D_Evaluate_dx(GNi_p, GNx_p, coords, &J_p);
-    fac = gp_weight[p] * J_p;
-
-    for (i = 0; i < NODES_PER_EL; i++) {
-      Fe[NSD * i] -= fac * Ni_p[i] * fx[p];
-      Fe[NSD * i + 1] -= fac * Ni_p[i] * fy[p];
-      Fe[NSD * i + 2] -= fac * Ni_p[i] * fz[p];
-    }
-  }
-}
-
-static void FormContinuityRhsQ13D(PetscScalar Fe[], PetscScalar coords[],
-                                  PetscScalar hc[]) {
-  PetscInt ngp;
-  PetscScalar gp_xi[GAUSS_POINTS][NSD];
-  PetscScalar gp_weight[GAUSS_POINTS];
-  PetscInt p, i;
-  PetscScalar Ni_p[NODES_PER_EL];
-  PetscScalar GNi_p[NSD][NODES_PER_EL], GNx_p[NSD][NODES_PER_EL];
-  PetscScalar J_p, fac;
-
-  /* define quadrature rule */
-  ConstructGaussQuadrature3D(&ngp, gp_xi, gp_weight);
-
-  /* evaluate integral */
-  for (p = 0; p < ngp; p++) {
-    ShapeFunctionQ13D_Evaluate(gp_xi[p], Ni_p);
-    ShapeFunctionQ13D_Evaluate_dxi(gp_xi[p], GNi_p);
-    ShapeFunctionQ13D_Evaluate_dx(GNi_p, GNx_p, coords, &J_p);
-    fac = gp_weight[p] * J_p;
-
-    for (i = 0; i < NODES_PER_EL; i++)
-      Fe[i] -= fac * Ni_p[i] * hc[p];
-  }
-}
-
-#define _ZERO_ROWCOL_i(A, i)                                                   \
-  {                                                                            \
-    PetscInt KK;                                                               \
-    PetscScalar tmp = A[24 * (i) + (i)];                                       \
-    for (KK = 0; KK < 24; KK++)                                                \
-      A[24 * (i) + KK] = 0.0;                                                  \
-    for (KK = 0; KK < 24; KK++)                                                \
-      A[24 * KK + (i)] = 0.0;                                                  \
-    A[24 * (i) + (i)] = tmp;                                                   \
-  }
-
-#define _ZERO_ROW_i(A, i)                                                      \
-  {                                                                            \
-    PetscInt KK;                                                               \
-    for (KK = 0; KK < 8; KK++)                                                 \
-      A[8 * (i) + KK] = 0.0;                                                   \
-  }
-
-#define _ZERO_COL_i(A, i)                                                      \
-  {                                                                            \
-    PetscInt KK;                                                               \
-    for (KK = 0; KK < 8; KK++)                                                 \
-      A[24 * KK + (i)] = 0.0;                                                  \
-  }
-
-static PetscErrorCode AssembleA_Stokes(Mat A, DM stokes_da,
-                                       CellProperties cell_properties) {
-  DM cda;
-  Vec coords;
-  DMDACoor3d ***_coords;
-  MatStencil u_eqn[NODES_PER_EL * U_DOFS];
-  MatStencil p_eqn[NODES_PER_EL * P_DOFS];
-  PetscInt sex, sey, sez, mx, my, mz;
-  PetscInt ei, ej, ek;
-  PetscScalar Ae[NODES_PER_EL * U_DOFS * NODES_PER_EL * U_DOFS];
-  PetscScalar Ge[NODES_PER_EL * U_DOFS * NODES_PER_EL * P_DOFS];
-  PetscScalar De[NODES_PER_EL * P_DOFS * NODES_PER_EL * U_DOFS];
-  PetscScalar Ce[NODES_PER_EL * P_DOFS * NODES_PER_EL * P_DOFS];
-  PetscScalar el_coords[NODES_PER_EL * NSD];
-  GaussPointCoefficients *props;
-  PetscScalar *prop_eta;
-  PetscInt n, M, N, P;
-
-  PetscFunctionBeginUser;
-  PetscCall(DMDAGetInfo(stokes_da, 0, &M, &N, &P, 0, 0, 0, 0, 0, 0, 0, 0, 0));
-  /* setup for coords */
-  PetscCall(DMGetCoordinateDM(stokes_da, &cda));
-  PetscCall(DMGetCoordinatesLocal(stokes_da, &coords));
-  PetscCall(DMDAVecGetArray(cda, coords, &_coords));
-  PetscCall(DMDAGetElementsCorners(stokes_da, &sex, &sey, &sez));
-  PetscCall(DMDAGetElementsSizes(stokes_da, &mx, &my, &mz));
-  for (ek = sez; ek < sez + mz; ek++) {
-    for (ej = sey; ej < sey + my; ej++) {
-      for (ei = sex; ei < sex + mx; ei++) {
-        /* get coords for the element */
-        PetscCall(GetElementCoords3D(_coords, ei, ej, ek, el_coords));
-        /* get cell properties */
-        PetscCall(CellPropertiesGetCell(cell_properties, ei, ej, ek, &props));
-        /* get coefficients for the element */
-        prop_eta = props->eta;
-
-        /* initialise element stiffness matrix */
-        PetscCall(PetscMemzero(Ae, sizeof(Ae)));
-        PetscCall(PetscMemzero(Ge, sizeof(Ge)));
-        PetscCall(PetscMemzero(De, sizeof(De)));
-        PetscCall(PetscMemzero(Ce, sizeof(Ce)));
-
-        /* form element stiffness matrix */
-        FormStressOperatorQ13D(Ae, el_coords, prop_eta);
-        FormGradientOperatorQ13D(Ge, el_coords);
-        /*#if defined(ASSEMBLE_LOWER_TRIANGULAR)*/
-        FormDivergenceOperatorQ13D(De, el_coords);
-        /*#endif*/
-        FormStabilisationOperatorQ13D(Ce, el_coords, prop_eta);
-
-        /* insert element matrix into global matrix */
-        PetscCall(DMDAGetElementEqnums3D_up(u_eqn, p_eqn, ei, ej, ek));
-
-        for (n = 0; n < NODES_PER_EL; n++) {
-          if ((u_eqn[3 * n].i == 0) || (u_eqn[3 * n].i == M - 1)) {
-            _ZERO_ROWCOL_i(Ae, 3 * n);
-            _ZERO_ROW_i(Ge, 3 * n);
-            _ZERO_COL_i(De, 3 * n);
-          }
-
-          if ((u_eqn[3 * n + 1].j == 0) || (u_eqn[3 * n + 1].j == N - 1)) {
-            _ZERO_ROWCOL_i(Ae, 3 * n + 1);
-            _ZERO_ROW_i(Ge, 3 * n + 1);
-            _ZERO_COL_i(De, 3 * n + 1);
-          }
-
-          if ((u_eqn[3 * n + 2].k == 0) || (u_eqn[3 * n + 2].k == P - 1)) {
-            _ZERO_ROWCOL_i(Ae, 3 * n + 2);
-            _ZERO_ROW_i(Ge, 3 * n + 2);
-            _ZERO_COL_i(De, 3 * n + 2);
-          }
-        }
-        PetscCall(MatSetValuesStencil(A, NODES_PER_EL * U_DOFS, u_eqn,
-                                      NODES_PER_EL * U_DOFS, u_eqn, Ae,
-                                      ADD_VALUES));
-        PetscCall(MatSetValuesStencil(A, NODES_PER_EL * U_DOFS, u_eqn,
-                                      NODES_PER_EL * P_DOFS, p_eqn, Ge,
-                                      ADD_VALUES));
-        PetscCall(MatSetValuesStencil(A, NODES_PER_EL * P_DOFS, p_eqn,
-                                      NODES_PER_EL * U_DOFS, u_eqn, De,
-                                      ADD_VALUES));
-        PetscCall(MatSetValuesStencil(A, NODES_PER_EL * P_DOFS, p_eqn,
-                                      NODES_PER_EL * P_DOFS, p_eqn, Ce,
-                                      ADD_VALUES));
+        PetscCall(SystemParametersCreate(&system_parameters, ctx));
+        system_parameters->faces_only = PETSC_TRUE;
+        system_parameters->level = level;
+        PetscCall(CreateSystem(system_parameters, &A_faces[level], NULL));
+        PetscCall(SystemParametersDestroy(&system_parameters));
       }
     }
-  }
-  PetscCall(MatAssemblyBegin(A, MAT_FINAL_ASSEMBLY));
-  PetscCall(MatAssemblyEnd(A, MAT_FINAL_ASSEMBLY));
 
-  PetscCall(DMDAVecRestoreArray(cda, coords, &_coords));
-  PetscFunctionReturn(PETSC_SUCCESS);
-}
+    /* Set up to populate enough to define the sub-solver */
+    PetscCall(KSPSetUp(ksp));
 
-static PetscErrorCode AssembleA_PCStokes(Mat A, DM stokes_da,
-                                         CellProperties cell_properties) {
-  DM cda;
-  Vec coords;
-  DMDACoor3d ***_coords;
-  MatStencil u_eqn[NODES_PER_EL * U_DOFS];
-  MatStencil p_eqn[NODES_PER_EL * P_DOFS];
-  PetscInt sex, sey, sez, mx, my, mz;
-  PetscInt ei, ej, ek;
-  PetscScalar Ae[NODES_PER_EL * U_DOFS * NODES_PER_EL * U_DOFS];
-  PetscScalar Ge[NODES_PER_EL * U_DOFS * NODES_PER_EL * P_DOFS];
-  PetscScalar De[NODES_PER_EL * P_DOFS * NODES_PER_EL * U_DOFS];
-  PetscScalar Ce[NODES_PER_EL * P_DOFS * NODES_PER_EL * P_DOFS];
-  PetscScalar el_coords[NODES_PER_EL * NSD];
-  GaussPointCoefficients *props;
-  PetscScalar *prop_eta;
-  PetscInt n, M, N, P;
+    /* Set multigrid components and settings */
+    {
+      KSP *sub_ksp;
 
-  PetscFunctionBeginUser;
-  PetscCall(DMDAGetInfo(stokes_da, 0, &M, &N, &P, 0, 0, 0, 0, 0, 0, 0, 0, 0));
-  /* setup for coords */
-  PetscCall(DMGetCoordinateDM(stokes_da, &cda));
-  PetscCall(DMGetCoordinatesLocal(stokes_da, &coords));
-  PetscCall(DMDAVecGetArray(cda, coords, &_coords));
-
-  PetscCall(DMDAGetElementsCorners(stokes_da, &sex, &sey, &sez));
-  PetscCall(DMDAGetElementsSizes(stokes_da, &mx, &my, &mz));
-  for (ek = sez; ek < sez + mz; ek++) {
-    for (ej = sey; ej < sey + my; ej++) {
-      for (ei = sex; ei < sex + mx; ei++) {
-        /* get coords for the element */
-        PetscCall(GetElementCoords3D(_coords, ei, ej, ek, el_coords));
-        /* get cell properties */
-        PetscCall(CellPropertiesGetCell(cell_properties, ei, ej, ek, &props));
-        /* get coefficients for the element */
-        prop_eta = props->eta;
-
-        /* initialise element stiffness matrix */
-        PetscCall(PetscMemzero(Ae, sizeof(Ae)));
-        PetscCall(PetscMemzero(Ge, sizeof(Ge)));
-        PetscCall(PetscMemzero(De, sizeof(De)));
-        PetscCall(PetscMemzero(Ce, sizeof(Ce)));
-
-        /* form element stiffness matrix */
-        FormStressOperatorQ13D(Ae, el_coords, prop_eta);
-        FormGradientOperatorQ13D(Ge, el_coords);
-        /* FormDivergenceOperatorQ13D(De,el_coords); */
-        FormScaledMassMatrixOperatorQ13D(Ce, el_coords, prop_eta);
-
-        /* insert element matrix into global matrix */
-        PetscCall(DMDAGetElementEqnums3D_up(u_eqn, p_eqn, ei, ej, ek));
-
-        for (n = 0; n < NODES_PER_EL; n++) {
-          if ((u_eqn[3 * n].i == 0) || (u_eqn[3 * n].i == M - 1)) {
-            _ZERO_ROWCOL_i(Ae, 3 * n);
-            _ZERO_ROW_i(Ge, 3 * n);
-            _ZERO_COL_i(De, 3 * n);
-          }
-
-          if ((u_eqn[3 * n + 1].j == 0) || (u_eqn[3 * n + 1].j == N - 1)) {
-            _ZERO_ROWCOL_i(Ae, 3 * n + 1);
-            _ZERO_ROW_i(Ge, 3 * n + 1);
-            _ZERO_COL_i(De, 3 * n + 1);
-          }
-
-          if ((u_eqn[3 * n + 2].k == 0) || (u_eqn[3 * n + 2].k == P - 1)) {
-            _ZERO_ROWCOL_i(Ae, 3 * n + 2);
-            _ZERO_ROW_i(Ge, 3 * n + 2);
-            _ZERO_COL_i(De, 3 * n + 2);
-          }
-        }
-        PetscCall(MatSetValuesStencil(A, NODES_PER_EL * U_DOFS, u_eqn,
-                                      NODES_PER_EL * U_DOFS, u_eqn, Ae,
-                                      ADD_VALUES));
-        PetscCall(MatSetValuesStencil(A, NODES_PER_EL * U_DOFS, u_eqn,
-                                      NODES_PER_EL * P_DOFS, p_eqn, Ge,
-                                      ADD_VALUES));
-        /*PetscCall(MatSetValuesStencil(A,NODES_PER_EL*P_DOFS,p_eqn,NODES_PER_EL*U_DOFS,u_eqn,De,ADD_VALUES));*/
-        PetscCall(MatSetValuesStencil(A, NODES_PER_EL * P_DOFS, p_eqn,
-                                      NODES_PER_EL * P_DOFS, p_eqn, Ce,
-                                      ADD_VALUES));
-      }
+      PetscCall(PCFieldSplitSchurGetSubKSP(pc, NULL, &sub_ksp));
+      ksp_faces = sub_ksp[0];
+      PetscCall(PetscFree(sub_ksp));
     }
-  }
-  PetscCall(MatAssemblyBegin(A, MAT_FINAL_ASSEMBLY));
-  PetscCall(MatAssemblyEnd(A, MAT_FINAL_ASSEMBLY));
+    PetscCall(KSPSetType(ksp_faces, KSPGCR));
+    PetscCall(KSPGetPC(ksp_faces, &pc_faces));
+    PetscCall(PCSetType(pc_faces, PCMG));
+    PetscCall(PCMGSetLevels(pc_faces, ctx->n_levels, NULL));
+    for (PetscInt level = 0; level < ctx->n_levels; ++level) {
+      KSP ksp_level;
+      PC pc_level;
 
-  PetscCall(DMDAVecRestoreArray(cda, coords, &_coords));
-  PetscFunctionReturn(PETSC_SUCCESS);
-}
+      /* Smoothers */
+      PetscCall(PCMGGetSmoother(pc_faces, level, &ksp_level));
+      PetscCall(KSPGetPC(ksp_level, &pc_level));
+      PetscCall(KSPSetOperators(ksp_level, A_faces[level], A_faces[level]));
+      if (level > 0)
+        PetscCall(PCSetType(pc_level, PCJACOBI));
 
-static PetscErrorCode AssembleF_Stokes(Vec F, DM stokes_da,
-                                       CellProperties cell_properties) {
-  DM cda;
-  Vec coords;
-  DMDACoor3d ***_coords;
-  MatStencil u_eqn[NODES_PER_EL * U_DOFS];
-  MatStencil p_eqn[NODES_PER_EL * P_DOFS];
-  PetscInt sex, sey, sez, mx, my, mz;
-  PetscInt ei, ej, ek;
-  PetscScalar Fe[NODES_PER_EL * U_DOFS];
-  PetscScalar He[NODES_PER_EL * P_DOFS];
-  PetscScalar el_coords[NODES_PER_EL * NSD];
-  GaussPointCoefficients *props;
-  PetscScalar *prop_fx, *prop_fy, *prop_fz, *prop_hc;
-  Vec local_F;
-  StokesDOF ***ff;
-  PetscInt n, M, N, P;
-
-  PetscFunctionBeginUser;
-  PetscCall(DMDAGetInfo(stokes_da, 0, &M, &N, &P, 0, 0, 0, 0, 0, 0, 0, 0, 0));
-  /* setup for coords */
-  PetscCall(DMGetCoordinateDM(stokes_da, &cda));
-  PetscCall(DMGetCoordinatesLocal(stokes_da, &coords));
-  PetscCall(DMDAVecGetArray(cda, coords, &_coords));
-
-  /* get access to the vector */
-  PetscCall(DMGetLocalVector(stokes_da, &local_F));
-  PetscCall(VecZeroEntries(local_F));
-  PetscCall(DMDAVecGetArray(stokes_da, local_F, &ff));
-  PetscCall(DMDAGetElementsCorners(stokes_da, &sex, &sey, &sez));
-  PetscCall(DMDAGetElementsSizes(stokes_da, &mx, &my, &mz));
-  for (ek = sez; ek < sez + mz; ek++) {
-    for (ej = sey; ej < sey + my; ej++) {
-      for (ei = sex; ei < sex + mx; ei++) {
-        /* get coords for the element */
-        PetscCall(GetElementCoords3D(_coords, ei, ej, ek, el_coords));
-        /* get cell properties */
-        PetscCall(CellPropertiesGetCell(cell_properties, ei, ej, ek, &props));
-        /* get coefficients for the element */
-        prop_fx = props->fx;
-        prop_fy = props->fy;
-        prop_fz = props->fz;
-        prop_hc = props->hc;
-
-        /* initialise element stiffness matrix */
-        PetscCall(PetscMemzero(Fe, sizeof(Fe)));
-        PetscCall(PetscMemzero(He, sizeof(He)));
-
-        /* form element stiffness matrix */
-        FormMomentumRhsQ13D(Fe, el_coords, prop_fx, prop_fy, prop_fz);
-        FormContinuityRhsQ13D(He, el_coords, prop_hc);
-
-        /* insert element matrix into global matrix */
-        PetscCall(DMDAGetElementEqnums3D_up(u_eqn, p_eqn, ei, ej, ek));
-
-        for (n = 0; n < NODES_PER_EL; n++) {
-          if ((u_eqn[3 * n].i == 0) || (u_eqn[3 * n].i == M - 1))
-            Fe[3 * n] = 0.0;
-
-          if ((u_eqn[3 * n + 1].j == 0) || (u_eqn[3 * n + 1].j == N - 1))
-            Fe[3 * n + 1] = 0.0;
-
-          if ((u_eqn[3 * n + 2].k == 0) || (u_eqn[3 * n + 2].k == P - 1))
-            Fe[3 * n + 2] = 0.0;
-        }
+      /* Transfer Operators */
+      if (level > 0) {
+        Mat restriction, interpolation;
+        DM dm_level = ctx->levels[level]->dm_faces;
+        DM dm_coarser = ctx->levels[level - 1]->dm_faces;
 
         PetscCall(
-            DMDASetValuesLocalStencil3D_ADD_VALUES(ff, u_eqn, p_eqn, Fe, He));
+            DMCreateInterpolation(dm_coarser, dm_level, &interpolation, NULL));
+        PetscCall(PCMGSetInterpolation(pc_faces, level, interpolation));
+        PetscCall(MatDestroy(&interpolation));
+        PetscCall(DMCreateRestriction(dm_coarser, dm_level, &restriction));
+        PetscCall(PCMGSetRestriction(pc_faces, level, restriction));
+        PetscCall(MatDestroy(&restriction));
       }
     }
   }
-  PetscCall(DMDAVecRestoreArray(stokes_da, local_F, &ff));
-  PetscCall(DMLocalToGlobalBegin(stokes_da, local_F, ADD_VALUES, F));
-  PetscCall(DMLocalToGlobalEnd(stokes_da, local_F, ADD_VALUES, F));
-  PetscCall(DMRestoreLocalVector(stokes_da, &local_F));
 
-  PetscCall(DMDAVecRestoreArray(cda, coords, &_coords));
-  PetscFunctionReturn(PETSC_SUCCESS);
-}
-
-static void evaluate_MS_FrankKamentski_constants(PetscReal *theta,
-                                                 PetscReal *MX, PetscReal *MY,
-                                                 PetscReal *MZ) {
-  *theta = 0.0;
-  *MX = 2.0 * PETSC_PI;
-  *MY = 2.0 * PETSC_PI;
-  *MZ = 2.0 * PETSC_PI;
-}
-static void evaluate_MS_FrankKamentski(PetscReal pos[], PetscReal v[],
-                                       PetscReal *p, PetscReal *eta,
-                                       PetscReal Fm[], PetscReal *Fc) {
-  PetscReal x, y, z;
-  PetscReal theta, MX, MY, MZ;
-
-  evaluate_MS_FrankKamentski_constants(&theta, &MX, &MY, &MZ);
-  x = pos[0];
-  y = pos[1];
-  z = pos[2];
-  if (v) {
-    /*
-     v[0] = PetscPowRealInt(z,3)*PetscExpReal(y)*PetscSinReal(PETSC_PI*x);
-     v[1] = z*cos(2.0*PETSC_PI*x)*PetscExpReal(-y)*PetscSinReal(PETSC_PI*y);
-     v[2] = -(PetscPowRealInt(x,3) +
-     PetscPowRealInt(y,3))*PetscSinReal(2.0*PETSC_PI*z);
-     */
-    /*
-     v[0] = PetscSinReal(PETSC_PI*x);
-     v[1] = PetscSinReal(PETSC_PI*y);
-     v[2] = PetscSinReal(PETSC_PI*z);
-     */
-    v[0] = PetscPowRealInt(z, 3) * PetscExpReal(y) * PetscSinReal(PETSC_PI * x);
-    v[1] = z * PetscCosReal(2.0 * PETSC_PI * x) * PetscExpReal(-y) *
-           PetscSinReal(PETSC_PI * y);
-    v[2] = PetscPowRealInt(z, 2) *
-               (PetscCosReal(2.0 * PETSC_PI * x) * PetscExpReal(-y) *
-                    PetscSinReal(PETSC_PI * y) / 2 -
-                PETSC_PI * PetscCosReal(PETSC_PI * y) *
-                    PetscCosReal(2.0 * PETSC_PI * x) * PetscExpReal(-y) / 2) -
-           PETSC_PI * PetscPowRealInt(z, 4) * PetscCosReal(PETSC_PI * x) *
-               PetscExpReal(y) / 4;
-  }
-  if (p)
-    *p = PetscPowRealInt(x, 2) + PetscPowRealInt(y, 2) + PetscPowRealInt(z, 2);
-  if (eta) {
-    /* eta = PetscExpReal(-theta*(1.0 - y -
-     * 0.1*PetscCosReal(MX*x)*PetscCosReal(MZ*z)*PetscSinReal(MY*y)));*/
-    *eta = 1.0;
-  }
-  if (Fm) {
-    /*
-     Fm[0] = -2*x
-     - 2.0*PetscPowRealInt(PETSC_PI,2)*PetscPowRealInt(z,3)*PetscExpReal(y)*PetscExpReal(-theta*(1
-     - y -
-     0.1*PetscCosReal(MX*x)*PetscCosReal(MZ*z)*PetscSinReal(MY*y)))*PetscSinReal(PETSC_PI*x)
-     - 0.2*MZ*theta*(-1.5*PetscPowRealInt(x,2)*PetscSinReal(2.0*PETSC_PI*z)
-     + 1.5*PetscPowRealInt(z,2)*PetscExpReal(y)*PetscSinReal(PETSC_PI*x))*PetscCosReal(MX*x)*PetscExpReal(-theta*(1
-     - y -
-     0.1*PetscCosReal(MX*x)*PetscCosReal(MZ*z)*PetscSinReal(MY*y)))*PetscSinReal(MY*y)*PetscSinReal(MZ*z)
-     -
-     0.2*PETSC_PI*MX*theta*PetscPowRealInt(z,3)*PetscCosReal(PETSC_PI*x)*PetscCosReal(MZ*z)*PetscExpReal(y)*PetscExpReal(-theta*(1
-     - y -
-     0.1*PetscCosReal(MX*x)*PetscCosReal(MZ*z)*PetscSinReal(MY*y)))*PetscSinReal(MX*x)*PetscSinReal(MY*y)
-     + 2.0*(3.0*z*PetscExpReal(y)*PetscSinReal(PETSC_PI*x)
-     - 3.0*PETSC_PI*PetscPowRealInt(x,2)*PetscCosReal(2.0*PETSC_PI*z))*PetscExpReal(-theta*(1
-     - y - 0.1*PetscCosReal(MX*x)*PetscCosReal(MZ*z)*PetscSinReal(MY*y)))
-     + 2.0*(0.5*PetscPowRealInt(z,3)*PetscExpReal(y)*PetscSinReal(PETSC_PI*x) +
-     PETSC_PI*z*PetscExpReal(-y)*PetscSinReal(PETSC_PI*y)*PetscSinReal(2.0*PETSC_PI*x)
-     - 1.0*z*PetscPowRealInt(PETSC_PI,2)*PetscCosReal(PETSC_PI*y)*PetscExpReal(-y)*PetscSinReal(2.0*PETSC_PI*x))*PetscExpReal(-theta*(1
-     - y - 0.1*PetscCosReal(MX*x)*PetscCosReal(MZ*z)*PetscSinReal(MY*y)))
-     + 2.0*theta*(1 +
-     0.1*MY*PetscCosReal(MX*x)*PetscCosReal(MY*y)*PetscCosReal(MZ*z))*(0.5*PetscPowRealInt(z,3)*PetscExpReal(y)*PetscSinReal(PETSC_PI*x)
-     - 1.0*PETSC_PI*z*PetscExpReal(-y)*PetscSinReal(PETSC_PI*y)*PetscSinReal(2.0*PETSC_PI*x))*PetscExpReal(-theta*(1
-     - y - 0.1*PetscCosReal(MX*x)*PetscCosReal(MZ*z)*PetscSinReal(MY*y))) ;
-     Fm[1] = -2*y -
-     0.2*MX*theta*(0.5*PetscPowRealInt(z,3)*PetscExpReal(y)*PetscSinReal(PETSC_PI*x)
-     - 1.0*PETSC_PI*z*PetscExpReal(-y)*PetscSinReal(PETSC_PI*y)*PetscSinReal(2.0*PETSC_PI*x))*PetscCosReal(MZ*z)*PetscExpReal(-theta*(1
-     - y -
-     0.1*PetscCosReal(MX*x)*PetscCosReal(MZ*z)*PetscSinReal(MY*y)))*PetscSinReal(MX*x)*PetscSinReal(MY*y)
-     - 0.2*MZ*theta*(-1.5*PetscPowRealInt(y,2)*PetscSinReal(2.0*PETSC_PI*z) +
-     0.5*PetscCosReal(2.0*PETSC_PI*x)*PetscExpReal(-y)*PetscSinReal(PETSC_PI*y))*PetscCosReal(MX*x)*PetscExpReal(-theta*(1
-     - y -
-     0.1*PetscCosReal(MX*x)*PetscCosReal(MZ*z)*PetscSinReal(MY*y)))*PetscSinReal(MY*y)*PetscSinReal(MZ*z)
-     + 2.0*(-2.0*z*PetscPowRealInt(PETSC_PI,2)*PetscCosReal(2.0*PETSC_PI*x)*PetscExpReal(-y)*PetscSinReal(PETSC_PI*y)
-     +
-     0.5*PETSC_PI*PetscPowRealInt(z,3)*PetscCosReal(PETSC_PI*x)*PetscExpReal(y))*PetscExpReal(-theta*(1
-     - y - 0.1*PetscCosReal(MX*x)*PetscCosReal(MZ*z)*PetscSinReal(MY*y)))
-     + 2.0*(z*PetscCosReal(2.0*PETSC_PI*x)*PetscExpReal(-y)*PetscSinReal(PETSC_PI*y)
-     -
-     z*PetscPowRealInt(PETSC_PI,2)*PetscCosReal(2.0*PETSC_PI*x)*PetscExpReal(-y)*PetscSinReal(PETSC_PI*y)
-     -
-     2*PETSC_PI*z*PetscCosReal(PETSC_PI*y)*PetscCosReal(2.0*PETSC_PI*x)*PetscExpReal(-y))*PetscExpReal(-theta*(1
-     - y - 0.1*PetscCosReal(MX*x)*PetscCosReal(MZ*z)*PetscSinReal(MY*y)))
-     + 2.0*theta*(1 +
-     0.1*MY*PetscCosReal(MX*x)*PetscCosReal(MY*y)*PetscCosReal(MZ*z))*(-z*PetscCosReal(2.0*PETSC_PI*x)*PetscExpReal(-y)*PetscSinReal(PETSC_PI*y)
-     +
-     PETSC_PI*z*PetscCosReal(PETSC_PI*y)*PetscCosReal(2.0*PETSC_PI*x)*PetscExpReal(-y))*PetscExpReal(-theta*(1
-     - y - 0.1*PetscCosReal(MX*x)*PetscCosReal(MZ*z)*PetscSinReal(MY*y)))
-     - 6.0*PETSC_PI*PetscPowRealInt(y,2)*PetscCosReal(2.0*PETSC_PI*z)*PetscExpReal(-theta*(1
-     - y - 0.1*PetscCosReal(MX*x)*PetscCosReal(MZ*z)*PetscSinReal(MY*y))); Fm[2]
-     = -2*z + 8.0*PetscPowRealInt(PETSC_PI,2)*(PetscPowRealInt(x,3) +
-     PetscPowRealInt(y,3))*PetscExpReal(-theta*(1 - y -
-     0.1*PetscCosReal(MX*x)*PetscCosReal(MZ*z)*PetscSinReal(MY*y)))*PetscSinReal(2.0*PETSC_PI*z)
-     - 0.2*MX*theta*(-1.5*PetscPowRealInt(x,2)*PetscSinReal(2.0*PETSC_PI*z)
-     + 1.5*PetscPowRealInt(z,2)*PetscExpReal(y)*PetscSinReal(PETSC_PI*x))*PetscCosReal(MZ*z)*PetscExpReal(-theta*(1
-     - y -
-     0.1*PetscCosReal(MX*x)*PetscCosReal(MZ*z)*PetscSinReal(MY*y)))*PetscSinReal(MX*x)*PetscSinReal(MY*y)
-     + 0.4*PETSC_PI*MZ*theta*(PetscPowRealInt(x,3) +
-     PetscPowRealInt(y,3))*PetscCosReal(MX*x)*PetscCosReal(2.0*PETSC_PI*z)*PetscExpReal(-theta*(1
-     - y -
-     0.1*PetscCosReal(MX*x)*PetscCosReal(MZ*z)*PetscSinReal(MY*y)))*PetscSinReal(MY*y)*PetscSinReal(MZ*z)
-     + 2.0*(-3.0*x*PetscSinReal(2.0*PETSC_PI*z)
-     + 1.5*PETSC_PI*PetscPowRealInt(z,2)*PetscCosReal(PETSC_PI*x)*PetscExpReal(y))*PetscExpReal(-theta*(1
-     - y - 0.1*PetscCosReal(MX*x)*PetscCosReal(MZ*z)*PetscSinReal(MY*y)))
-     + 2.0*(-3.0*y*PetscSinReal(2.0*PETSC_PI*z) -
-     0.5*PetscCosReal(2.0*PETSC_PI*x)*PetscExpReal(-y)*PetscSinReal(PETSC_PI*y)
-     +
-     0.5*PETSC_PI*PetscCosReal(PETSC_PI*y)*PetscCosReal(2.0*PETSC_PI*x)*PetscExpReal(-y))*PetscExpReal(-theta*(1
-     - y - 0.1*PetscCosReal(MX*x)*PetscCosReal(MZ*z)*PetscSinReal(MY*y)))
-     + 2.0*theta*(1 +
-     0.1*MY*PetscCosReal(MX*x)*PetscCosReal(MY*y)*PetscCosReal(MZ*z))*(-1.5*PetscPowRealInt(y,2)*PetscSinReal(2.0*PETSC_PI*z)
-     +
-     0.5*PetscCosReal(2.0*PETSC_PI*x)*PetscExpReal(-y)*PetscSinReal(PETSC_PI*y))*PetscExpReal(-theta*(1
-     - y - 0.1*PetscCosReal(MX*x)*PetscCosReal(MZ*z)*PetscSinReal(MY*y)))  ;
-     */
-    /*
-     Fm[0]=-2*x - 2.0*PetscPowRealInt(PETSC_PI,2)*PetscSinReal(PETSC_PI*x);
-     Fm[1]=-2*y - 2.0*PetscPowRealInt(PETSC_PI,2)*PetscSinReal(PETSC_PI*y);
-     Fm[2]=-2*z - 2.0*PetscPowRealInt(PETSC_PI,2)*PetscSinReal(PETSC_PI*z);
-     */
-    /*
-     Fm[0] = -2*x +
-     PetscPowRealInt(z,3)*PetscExpReal(y)*PetscSinReal(PETSC_PI*x)
-     + 6.0*z*PetscExpReal(y)*PetscSinReal(PETSC_PI*x)
-     - 6.0*PETSC_PI*PetscPowRealInt(x,2)*PetscCosReal(2.0*PETSC_PI*z)
-     - 2.0*PetscPowRealInt(PETSC_PI,2)*PetscPowRealInt(z,3)*PetscExpReal(y)*PetscSinReal(PETSC_PI*x)
-     + 2.0*PETSC_PI*z*PetscExpReal(-y)*PetscSinReal(PETSC_PI*y)*PetscSinReal(2.0*PETSC_PI*x)
-     - 2.0*z*PetscPowRealInt(PETSC_PI,2)*PetscCosReal(PETSC_PI*y)*PetscExpReal(-y)*PetscSinReal(2.0*PETSC_PI*x)
-     ; Fm[1] = -2*y
-     - 6.0*PETSC_PI*PetscPowRealInt(y,2)*PetscCosReal(2.0*PETSC_PI*z)
-     + 2.0*z*PetscCosReal(2.0*PETSC_PI*x)*PetscExpReal(-y)*PetscSinReal(PETSC_PI*y)
-     - 6.0*z*PetscPowRealInt(PETSC_PI,2)*PetscCosReal(2.0*PETSC_PI*x)*PetscExpReal(-y)*PetscSinReal(PETSC_PI*y)
-     + PETSC_PI*PetscPowRealInt(z,3)*PetscCosReal(PETSC_PI*x)*PetscExpReal(y)
-     - 4.0*PETSC_PI*z*PetscCosReal(PETSC_PI*y)*PetscCosReal(2.0*PETSC_PI*x)*PetscExpReal(-y);
-     Fm[2] = -2*z - 6.0*x*PetscSinReal(2.0*PETSC_PI*z)
-     - 6.0*y*PetscSinReal(2.0*PETSC_PI*z) -
-     PetscCosReal(2.0*PETSC_PI*x)*PetscExpReal(-y)*PetscSinReal(PETSC_PI*y)
-     + 8.0*PetscPowRealInt(PETSC_PI,2)*(PetscPowRealInt(x,3) +
-     PetscPowRealInt(y,3))*PetscSinReal(2.0*PETSC_PI*z)
-     + 3.0*PETSC_PI*PetscPowRealInt(z,2)*PetscCosReal(PETSC_PI*x)*PetscExpReal(y)
-     +
-     PETSC_PI*PetscCosReal(PETSC_PI*y)*PetscCosReal(2.0*PETSC_PI*x)*PetscExpReal(-y)
-     ;
-     */
-    Fm[0] =
-        -2 * x +
-        2 * z *
-            (PetscPowRealInt(PETSC_PI, 2) * PetscCosReal(PETSC_PI * y) *
-                 PetscExpReal(-y) * PetscSinReal(2.0 * PETSC_PI * x) -
-             1.0 * PETSC_PI * PetscExpReal(-y) * PetscSinReal(PETSC_PI * y) *
-                 PetscSinReal(2.0 * PETSC_PI * x)) +
-        PetscPowRealInt(z, 3) * PetscExpReal(y) * PetscSinReal(PETSC_PI * x) +
-        6.0 * z * PetscExpReal(y) * PetscSinReal(PETSC_PI * x) -
-        1.0 * PetscPowRealInt(PETSC_PI, 2) * PetscPowRealInt(z, 3) *
-            PetscExpReal(y) * PetscSinReal(PETSC_PI * x) +
-        2.0 * PETSC_PI * z * PetscExpReal(-y) * PetscSinReal(PETSC_PI * y) *
-            PetscSinReal(2.0 * PETSC_PI * x) -
-        2.0 * z * PetscPowRealInt(PETSC_PI, 2) * PetscCosReal(PETSC_PI * y) *
-            PetscExpReal(-y) * PetscSinReal(2.0 * PETSC_PI * x);
-    Fm[1] =
-        -2 * y +
-        2 * z *
-            (-PetscCosReal(2.0 * PETSC_PI * x) * PetscExpReal(-y) *
-                 PetscSinReal(PETSC_PI * y) / 2 +
-             PetscPowRealInt(PETSC_PI, 2) * PetscCosReal(2.0 * PETSC_PI * x) *
-                 PetscExpReal(-y) * PetscSinReal(PETSC_PI * y) / 2 +
-             PETSC_PI * PetscCosReal(PETSC_PI * y) *
-                 PetscCosReal(2.0 * PETSC_PI * x) * PetscExpReal(-y)) +
-        2.0 * z * PetscCosReal(2.0 * PETSC_PI * x) * PetscExpReal(-y) *
-            PetscSinReal(PETSC_PI * y) -
-        6.0 * z * PetscPowRealInt(PETSC_PI, 2) *
-            PetscCosReal(2.0 * PETSC_PI * x) * PetscExpReal(-y) *
-            PetscSinReal(PETSC_PI * y) -
-        4.0 * PETSC_PI * z * PetscCosReal(PETSC_PI * y) *
-            PetscCosReal(2.0 * PETSC_PI * x) * PetscExpReal(-y);
-    Fm[2] =
-        -2 * z +
-        PetscPowRealInt(z, 2) *
-            (-2.0 * PetscPowRealInt(PETSC_PI, 2) *
-                 PetscCosReal(2.0 * PETSC_PI * x) * PetscExpReal(-y) *
-                 PetscSinReal(PETSC_PI * y) +
-             2.0 * PetscPowRealInt(PETSC_PI, 3) * PetscCosReal(PETSC_PI * y) *
-                 PetscCosReal(2.0 * PETSC_PI * x) * PetscExpReal(-y)) +
-        PetscPowRealInt(z, 2) *
-            (PetscCosReal(2.0 * PETSC_PI * x) * PetscExpReal(-y) *
-                 PetscSinReal(PETSC_PI * y) / 2 -
-             3 * PetscPowRealInt(PETSC_PI, 2) *
-                 PetscCosReal(2.0 * PETSC_PI * x) * PetscExpReal(-y) *
-                 PetscSinReal(PETSC_PI * y) / 2 +
-             PetscPowRealInt(PETSC_PI, 3) * PetscCosReal(PETSC_PI * y) *
-                 PetscCosReal(2.0 * PETSC_PI * x) * PetscExpReal(-y) / 2 -
-             3 * PETSC_PI * PetscCosReal(PETSC_PI * y) *
-                 PetscCosReal(2.0 * PETSC_PI * x) * PetscExpReal(-y) / 2) +
-        1.0 * PetscCosReal(2.0 * PETSC_PI * x) * PetscExpReal(-y) *
-            PetscSinReal(PETSC_PI * y) +
-        0.25 * PetscPowRealInt(PETSC_PI, 3) * PetscPowRealInt(z, 4) *
-            PetscCosReal(PETSC_PI * x) * PetscExpReal(y) -
-        0.25 * PETSC_PI * PetscPowRealInt(z, 4) * PetscCosReal(PETSC_PI * x) *
-            PetscExpReal(y) -
-        3.0 * PETSC_PI * PetscPowRealInt(z, 2) * PetscCosReal(PETSC_PI * x) *
-            PetscExpReal(y) -
-        1.0 * PETSC_PI * PetscCosReal(PETSC_PI * y) *
-            PetscCosReal(2.0 * PETSC_PI * x) * PetscExpReal(-y);
-  }
-  if (Fc) {
-    /* Fc = -2.0*PETSC_PI*(PetscPowRealInt(x,3) +
-     * PetscPowRealInt(y,3))*PetscCosReal(2.0*PETSC_PI*z) -
-     * z*PetscCosReal(2.0*PETSC_PI*x)*PetscExpReal(-y)*PetscSinReal(PETSC_PI*y)
-     * + PETSC_PI*PetscPowRealInt(z,3)*PetscCosReal(PETSC_PI*x)*PetscExpReal(y)
-     * +
-     * PETSC_PI*z*PetscCosReal(PETSC_PI*y)*PetscCosReal(2.0*PETSC_PI*x)*PetscExpReal(-y)
-     * ;*/
-    /* Fc = PETSC_PI*PetscCosReal(PETSC_PI*x) +
-     * PETSC_PI*PetscCosReal(PETSC_PI*y) + PETSC_PI*PetscCosReal(PETSC_PI*z);*/
-    /* Fc = -2.0*PETSC_PI*(PetscPowRealInt(x,3) +
-     * PetscPowRealInt(y,3))*PetscCosReal(2.0*PETSC_PI*z) -
-     * z*PetscCosReal(2.0*PETSC_PI*x)*PetscExpReal(-y)*PetscSinReal(PETSC_PI*y)
-     * + PETSC_PI*PetscPowRealInt(z,3)*PetscCosReal(PETSC_PI*x)*PetscExpReal(y)
-     * +
-     * PETSC_PI*z*PetscCosReal(PETSC_PI*y)*PetscCosReal(2.0*PETSC_PI*x)*PetscExpReal(-y);*/
-    *Fc = 0.0;
-  }
-}
-
-static PetscErrorCode DMDACreateManufacturedSolution(PetscInt mx, PetscInt my,
-                                                     PetscInt mz, DM *_da,
-                                                     Vec *_X) {
-  DM da, cda;
-  Vec X;
-  StokesDOF ***_stokes;
-  Vec coords;
-  DMDACoor3d ***_coords;
-  PetscInt si, sj, sk, ei, ej, ek, i, j, k;
-
-  PetscFunctionBeginUser;
-  PetscCall(DMDACreate3d(PETSC_COMM_WORLD, DM_BOUNDARY_NONE, DM_BOUNDARY_NONE,
-                         DM_BOUNDARY_NONE, DMDA_STENCIL_BOX, mx + 1, my + 1,
-                         mz + 1, PETSC_DECIDE, PETSC_DECIDE, PETSC_DECIDE, 4, 1,
-                         NULL, NULL, NULL, &da));
-  PetscCall(DMSetFromOptions(da));
-  PetscCall(DMSetUp(da));
-  PetscCall(DMDASetFieldName(da, 0, "anlytic_Vx"));
-  PetscCall(DMDASetFieldName(da, 1, "anlytic_Vy"));
-  PetscCall(DMDASetFieldName(da, 2, "anlytic_Vz"));
-  PetscCall(DMDASetFieldName(da, 3, "analytic_P"));
-
-  PetscCall(DMDASetUniformCoordinates(da, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0));
-
-  PetscCall(DMGetCoordinatesLocal(da, &coords));
-  PetscCall(DMGetCoordinateDM(da, &cda));
-  PetscCall(DMDAVecGetArray(cda, coords, &_coords));
-
-  PetscCall(DMCreateGlobalVector(da, &X));
-  PetscCall(DMDAVecGetArray(da, X, &_stokes));
-
-  PetscCall(DMDAGetCorners(da, &si, &sj, &sk, &ei, &ej, &ek));
-  for (k = sk; k < sk + ek; k++) {
-    for (j = sj; j < sj + ej; j++) {
-      for (i = si; i < si + ei; i++) {
-        PetscReal pos[NSD], pressure, vel[NSD];
-
-        pos[0] = PetscRealPart(_coords[k][j][i].x);
-        pos[1] = PetscRealPart(_coords[k][j][i].y);
-        pos[2] = PetscRealPart(_coords[k][j][i].z);
-
-        evaluate_MS_FrankKamentski(pos, vel, &pressure, NULL, NULL, NULL);
-
-        _stokes[k][j][i].u_dof = vel[0];
-        _stokes[k][j][i].v_dof = vel[1];
-        _stokes[k][j][i].w_dof = vel[2];
-        _stokes[k][j][i].p_dof = pressure;
-      }
-    }
-  }
-  PetscCall(DMDAVecRestoreArray(da, X, &_stokes));
-  PetscCall(DMDAVecRestoreArray(cda, coords, &_coords));
-
-  *_da = da;
-  *_X = X;
-  PetscFunctionReturn(PETSC_SUCCESS);
-}
-
-static PetscErrorCode DMDAIntegrateErrors3D(DM stokes_da, Vec X,
-                                            Vec X_analytic) {
-  DM cda;
-  Vec coords, X_analytic_local, X_local;
-  DMDACoor3d ***_coords;
-  PetscInt sex, sey, sez, mx, my, mz;
-  PetscInt ei, ej, ek;
-  PetscScalar el_coords[NODES_PER_EL * NSD];
-  StokesDOF ***stokes_analytic, ***stokes;
-  StokesDOF stokes_analytic_e[NODES_PER_EL], stokes_e[NODES_PER_EL];
-
-  PetscScalar GNi_p[NSD][NODES_PER_EL], GNx_p[NSD][NODES_PER_EL];
-  PetscScalar Ni_p[NODES_PER_EL];
-  PetscInt ngp;
-  PetscScalar gp_xi[GAUSS_POINTS][NSD];
-  PetscScalar gp_weight[GAUSS_POINTS];
-  PetscInt p, i;
-  PetscScalar J_p, fac;
-  PetscScalar h, p_e_L2, u_e_L2, u_e_H1, p_L2, u_L2, u_H1, tp_L2, tu_L2, tu_H1;
-  PetscScalar tint_p_ms, tint_p, int_p_ms, int_p;
-  PetscInt M;
-  PetscReal xymin[NSD], xymax[NSD];
-
-  PetscFunctionBeginUser;
-  /* define quadrature rule */
-  ConstructGaussQuadrature3D(&ngp, gp_xi, gp_weight);
-
-  /* setup for coords */
-  PetscCall(DMGetCoordinateDM(stokes_da, &cda));
-  PetscCall(DMGetCoordinatesLocal(stokes_da, &coords));
-  PetscCall(DMDAVecGetArray(cda, coords, &_coords));
-
-  /* setup for analytic */
-  PetscCall(DMCreateLocalVector(stokes_da, &X_analytic_local));
-  PetscCall(DMGlobalToLocalBegin(stokes_da, X_analytic, INSERT_VALUES,
-                                 X_analytic_local));
-  PetscCall(DMGlobalToLocalEnd(stokes_da, X_analytic, INSERT_VALUES,
-                               X_analytic_local));
-  PetscCall(DMDAVecGetArray(stokes_da, X_analytic_local, &stokes_analytic));
-
-  /* setup for solution */
-  PetscCall(DMCreateLocalVector(stokes_da, &X_local));
-  PetscCall(DMGlobalToLocalBegin(stokes_da, X, INSERT_VALUES, X_local));
-  PetscCall(DMGlobalToLocalEnd(stokes_da, X, INSERT_VALUES, X_local));
-  PetscCall(DMDAVecGetArray(stokes_da, X_local, &stokes));
-
-  PetscCall(DMDAGetInfo(stokes_da, 0, &M, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0));
-  PetscCall(DMGetBoundingBox(stokes_da, xymin, xymax));
-
-  h = (xymax[0] - xymin[0]) / ((PetscReal)(M - 1));
-
-  tp_L2 = tu_L2 = tu_H1 = 0.0;
-  tint_p_ms = tint_p = 0.0;
-
-  PetscCall(DMDAGetElementsCorners(stokes_da, &sex, &sey, &sez));
-  PetscCall(DMDAGetElementsSizes(stokes_da, &mx, &my, &mz));
-  for (ek = sez; ek < sez + mz; ek++) {
-    for (ej = sey; ej < sey + my; ej++) {
-      for (ei = sex; ei < sex + mx; ei++) {
-        /* get coords for the element */
-        PetscCall(GetElementCoords3D(_coords, ei, ej, ek, el_coords));
-        PetscCall(StokesDAGetNodalFields3D(stokes, ei, ej, ek, stokes_e));
-        PetscCall(StokesDAGetNodalFields3D(stokes_analytic, ei, ej, ek,
-                                           stokes_analytic_e));
-
-        /* evaluate integral */
-        for (p = 0; p < ngp; p++) {
-          ShapeFunctionQ13D_Evaluate(gp_xi[p], Ni_p);
-          ShapeFunctionQ13D_Evaluate_dxi(gp_xi[p], GNi_p);
-          ShapeFunctionQ13D_Evaluate_dx(GNi_p, GNx_p, el_coords, &J_p);
-          fac = gp_weight[p] * J_p;
-
-          for (i = 0; i < NODES_PER_EL; i++) {
-            tint_p_ms = tint_p_ms + fac * Ni_p[i] * stokes_analytic_e[i].p_dof;
-            tint_p = tint_p + fac * Ni_p[i] * stokes_e[i].p_dof;
-          }
-        }
-      }
-    }
-  }
-  PetscCall(MPIU_Allreduce(&tint_p_ms, &int_p_ms, 1, MPIU_SCALAR, MPIU_SUM,
-                           PETSC_COMM_WORLD));
-  PetscCall(MPIU_Allreduce(&tint_p, &int_p, 1, MPIU_SCALAR, MPIU_SUM,
-                           PETSC_COMM_WORLD));
-
-  PetscCall(PetscPrintf(PETSC_COMM_WORLD, "\\int P dv %1.4e (h)  %1.4e (ms)\n",
-                        (double)PetscRealPart(int_p),
-                        (double)PetscRealPart(int_p_ms)));
-
-  /* remove mine and add manufacture one */
-  PetscCall(DMDAVecRestoreArray(stokes_da, X_analytic_local, &stokes_analytic));
-  PetscCall(DMDAVecRestoreArray(stokes_da, X_local, &stokes));
-
+  /* Solve */
+  PetscCall(VecDuplicate(b, &x));
+  PetscCall(KSPSolve(ksp, b, x));
   {
-    PetscInt k, L, dof;
-    PetscScalar *fields;
-    PetscCall(DMDAGetInfo(stokes_da, 0, 0, 0, 0, 0, 0, 0, &dof, 0, 0, 0, 0, 0));
-
-    PetscCall(VecGetLocalSize(X_local, &L));
-    PetscCall(VecGetArray(X_local, &fields));
-    for (k = 0; k < L / dof; k++)
-      fields[dof * k + 3] = fields[dof * k + 3] - int_p + int_p_ms;
-    PetscCall(VecRestoreArray(X_local, &fields));
-
-    PetscCall(VecGetLocalSize(X, &L));
-    PetscCall(VecGetArray(X, &fields));
-    for (k = 0; k < L / dof; k++)
-      fields[dof * k + 3] = fields[dof * k + 3] - int_p + int_p_ms;
-    PetscCall(VecRestoreArray(X, &fields));
+    KSPConvergedReason reason;
+    PetscCall(KSPGetConvergedReason(ksp, &reason));
+    PetscCheck(reason >= 0, PETSC_COMM_WORLD, PETSC_ERR_CONV_FAILED,
+               "Linear solve failed");
   }
 
-  PetscCall(DMDAVecGetArray(stokes_da, X_local, &stokes));
-  PetscCall(DMDAVecGetArray(stokes_da, X_analytic_local, &stokes_analytic));
-
-  for (ek = sez; ek < sez + mz; ek++) {
-    for (ej = sey; ej < sey + my; ej++) {
-      for (ei = sex; ei < sex + mx; ei++) {
-        /* get coords for the element */
-        PetscCall(GetElementCoords3D(_coords, ei, ej, ek, el_coords));
-        PetscCall(StokesDAGetNodalFields3D(stokes, ei, ej, ek, stokes_e));
-        PetscCall(StokesDAGetNodalFields3D(stokes_analytic, ei, ej, ek,
-                                           stokes_analytic_e));
-
-        /* evaluate integral */
-        p_e_L2 = 0.0;
-        u_e_L2 = 0.0;
-        u_e_H1 = 0.0;
-        for (p = 0; p < ngp; p++) {
-          ShapeFunctionQ13D_Evaluate(gp_xi[p], Ni_p);
-          ShapeFunctionQ13D_Evaluate_dxi(gp_xi[p], GNi_p);
-          ShapeFunctionQ13D_Evaluate_dx(GNi_p, GNx_p, el_coords, &J_p);
-          fac = gp_weight[p] * J_p;
-
-          for (i = 0; i < NODES_PER_EL; i++) {
-            PetscScalar u_error, v_error, w_error;
-
-            p_e_L2 =
-                p_e_L2 + fac * Ni_p[i] *
-                             (stokes_e[i].p_dof - stokes_analytic_e[i].p_dof) *
-                             (stokes_e[i].p_dof - stokes_analytic_e[i].p_dof);
-
-            u_error = stokes_e[i].u_dof - stokes_analytic_e[i].u_dof;
-            v_error = stokes_e[i].v_dof - stokes_analytic_e[i].v_dof;
-            w_error = stokes_e[i].w_dof - stokes_analytic_e[i].w_dof;
-            u_e_L2 +=
-                fac * Ni_p[i] *
-                (u_error * u_error + v_error * v_error + w_error * w_error);
-
-            u_e_H1 =
-                u_e_H1 +
-                fac * (GNx_p[0][i] * u_error * GNx_p[0][i] * u_error /* du/dx */
-                       + GNx_p[1][i] * u_error * GNx_p[1][i] * u_error +
-                       GNx_p[2][i] * u_error * GNx_p[2][i] * u_error +
-                       GNx_p[0][i] * v_error * GNx_p[0][i] * v_error /* dv/dx */
-                       + GNx_p[1][i] * v_error * GNx_p[1][i] * v_error +
-                       GNx_p[2][i] * v_error * GNx_p[2][i] * v_error +
-                       GNx_p[0][i] * w_error * GNx_p[0][i] * w_error /* dw/dx */
-                       + GNx_p[1][i] * w_error * GNx_p[1][i] * w_error +
-                       GNx_p[2][i] * w_error * GNx_p[2][i] * w_error);
-          }
-        }
-
-        tp_L2 += p_e_L2;
-        tu_L2 += u_e_L2;
-        tu_H1 += u_e_H1;
-      }
-    }
-  }
-  PetscCall(MPIU_Allreduce(&tp_L2, &p_L2, 1, MPIU_SCALAR, MPIU_SUM,
-                           PETSC_COMM_WORLD));
-  PetscCall(MPIU_Allreduce(&tu_L2, &u_L2, 1, MPIU_SCALAR, MPIU_SUM,
-                           PETSC_COMM_WORLD));
-  PetscCall(MPIU_Allreduce(&tu_H1, &u_H1, 1, MPIU_SCALAR, MPIU_SUM,
-                           PETSC_COMM_WORLD));
-  p_L2 = PetscSqrtScalar(p_L2);
-  u_L2 = PetscSqrtScalar(u_L2);
-  u_H1 = PetscSqrtScalar(u_H1);
-
-  PetscCall(PetscPrintf(PETSC_COMM_WORLD, "%1.4e   %1.4e   %1.4e   %1.4e \n",
-                        (double)PetscRealPart(h), (double)PetscRealPart(p_L2),
-                        (double)PetscRealPart(u_L2),
-                        (double)PetscRealPart(u_H1)));
-
-  PetscCall(DMDAVecRestoreArray(cda, coords, &_coords));
-
-  PetscCall(DMDAVecRestoreArray(stokes_da, X_analytic_local, &stokes_analytic));
-  PetscCall(VecDestroy(&X_analytic_local));
-  PetscCall(DMDAVecRestoreArray(stokes_da, X_local, &stokes));
-  PetscCall(VecDestroy(&X_local));
-  PetscFunctionReturn(PETSC_SUCCESS);
-}
-
-PetscErrorCode DAView_3DVTK_StructuredGrid_appended(DM da, Vec FIELD,
-                                                    const char file_prefix[]) {
-  char vtk_filename[PETSC_MAX_PATH_LEN];
-  PetscMPIInt rank;
-  MPI_Comm comm;
-  FILE *vtk_fp = NULL;
-  const char *byte_order =
-      PetscBinaryBigEndian() ? "BigEndian" : "LittleEndian";
-  PetscInt si, sj, sk, nx, ny, nz, i;
-  PetscInt f, n_fields, N;
-  DM cda;
-  Vec coords;
-  Vec l_FIELD;
-  PetscScalar *_L_FIELD;
-  PetscInt memory_offset;
-  PetscScalar *buffer;
-
-  PetscFunctionBeginUser;
-  /* create file name */
-  PetscCall(PetscObjectGetComm((PetscObject)da, &comm));
-  PetscCallMPI(MPI_Comm_rank(comm, &rank));
-  PetscCall(PetscSNPrintf(vtk_filename, sizeof(vtk_filename),
-                          "subdomain-%s-p%1.4d.vts", file_prefix, rank));
-
-  /* open file and write header */
-  vtk_fp = fopen(vtk_filename, "w");
-  PetscCheck(vtk_fp, PETSC_COMM_SELF, PETSC_ERR_SYS, "Cannot open file = %s ",
-             vtk_filename);
-
-  PetscCall(PetscFPrintf(PETSC_COMM_SELF, vtk_fp, "<?xml version=\"1.0\"?>\n"));
-
-  /* coords */
-  PetscCall(DMDAGetGhostCorners(da, &si, &sj, &sk, &nx, &ny, &nz));
-  N = nx * ny * nz;
-
-  PetscCall(PetscFPrintf(
-      PETSC_COMM_SELF, vtk_fp,
-      "<VTKFile type=\"StructuredGrid\" version=\"0.1\" byte_order=\"%s\">\n",
-      byte_order));
-  PetscCall(PetscFPrintf(PETSC_COMM_SELF, vtk_fp,
-                         "  <StructuredGrid WholeExtent=\"%" PetscInt_FMT
-                         " %" PetscInt_FMT " %" PetscInt_FMT " %" PetscInt_FMT
-                         " %" PetscInt_FMT " %" PetscInt_FMT "\">\n",
-                         si, si + nx - 1, sj, sj + ny - 1, sk, sk + nz - 1));
-  PetscCall(PetscFPrintf(PETSC_COMM_SELF, vtk_fp,
-                         "    <Piece Extent=\"%" PetscInt_FMT " %" PetscInt_FMT
-                         " %" PetscInt_FMT " %" PetscInt_FMT " %" PetscInt_FMT
-                         " %" PetscInt_FMT "\">\n",
-                         si, si + nx - 1, sj, sj + ny - 1, sk, sk + nz - 1));
-
-  memory_offset = 0;
-
-  PetscCall(
-      PetscFPrintf(PETSC_COMM_SELF, vtk_fp, "      <CellData></CellData>\n"));
-
-  PetscCall(PetscFPrintf(PETSC_COMM_SELF, vtk_fp, "      <Points>\n"));
-
-  /* copy coordinates */
-  PetscCall(DMGetCoordinateDM(da, &cda));
-  PetscCall(DMGetCoordinatesLocal(da, &coords));
-  PetscCall(PetscFPrintf(
-      PETSC_COMM_SELF, vtk_fp,
-      "        <DataArray type=\"Float64\" NumberOfComponents=\"3\" "
-      "format=\"appended\" offset=\"%" PetscInt_FMT "\" />\n",
-      memory_offset));
-  memory_offset =
-      memory_offset + sizeof(PetscInt) + sizeof(PetscScalar) * N * 3;
-
-  PetscCall(PetscFPrintf(PETSC_COMM_SELF, vtk_fp, "      </Points>\n"));
-
-  PetscCall(
-      PetscFPrintf(PETSC_COMM_SELF, vtk_fp, "      <PointData Scalars=\" "));
-  PetscCall(DMDAGetInfo(da, 0, 0, 0, 0, 0, 0, 0, &n_fields, 0, 0, 0, 0, 0));
-  for (f = 0; f < n_fields; f++) {
-    const char *field_name;
-    PetscCall(DMDAGetFieldName(da, f, &field_name));
-    PetscCall(PetscFPrintf(PETSC_COMM_SELF, vtk_fp, "%s ", field_name));
-  }
-  PetscCall(PetscFPrintf(PETSC_COMM_SELF, vtk_fp, "\">\n"));
-
-  for (f = 0; f < n_fields; f++) {
-    const char *field_name;
-
-    PetscCall(DMDAGetFieldName(da, f, &field_name));
-    PetscCall(PetscFPrintf(PETSC_COMM_SELF, vtk_fp,
-                           "        <DataArray type=\"Float64\" Name=\"%s\" "
-                           "format=\"appended\" offset=\"%" PetscInt_FMT
-                           "\"/>\n",
-                           field_name, memory_offset));
-    memory_offset = memory_offset + sizeof(PetscInt) + sizeof(PetscScalar) * N;
-  }
-
-  PetscCall(PetscFPrintf(PETSC_COMM_SELF, vtk_fp, "      </PointData>\n"));
-  PetscCall(PetscFPrintf(PETSC_COMM_SELF, vtk_fp, "    </Piece>\n"));
-  PetscCall(PetscFPrintf(PETSC_COMM_SELF, vtk_fp, "  </StructuredGrid>\n"));
-
-  PetscCall(PetscMalloc1(N, &buffer));
-  PetscCall(DMGetLocalVector(da, &l_FIELD));
-  PetscCall(DMGlobalToLocalBegin(da, FIELD, INSERT_VALUES, l_FIELD));
-  PetscCall(DMGlobalToLocalEnd(da, FIELD, INSERT_VALUES, l_FIELD));
-  PetscCall(VecGetArray(l_FIELD, &_L_FIELD));
-
-  PetscCall(PetscFPrintf(PETSC_COMM_SELF, vtk_fp,
-                         "  <AppendedData encoding=\"raw\">\n"));
-  PetscCall(PetscFPrintf(PETSC_COMM_SELF, vtk_fp, "_"));
-
-  /* write coordinates */
-  {
-    int length = sizeof(PetscScalar) * N * 3;
-    PetscScalar *allcoords;
-
-    fwrite(&length, sizeof(int), 1, vtk_fp);
-    PetscCall(VecGetArray(coords, &allcoords));
-    fwrite(allcoords, sizeof(PetscScalar), 3 * N, vtk_fp);
-    PetscCall(VecRestoreArray(coords, &allcoords));
-  }
-  /* write fields */
-  for (f = 0; f < n_fields; f++) {
-    int length = sizeof(PetscScalar) * N;
-    fwrite(&length, sizeof(int), 1, vtk_fp);
-    /* load */
-    for (i = 0; i < N; i++)
-      buffer[i] = _L_FIELD[n_fields * i + f];
-
-    /* write */
-    fwrite(buffer, sizeof(PetscScalar), N, vtk_fp);
-  }
-  PetscCall(PetscFPrintf(PETSC_COMM_SELF, vtk_fp, "\n  </AppendedData>\n"));
-
-  PetscCall(PetscFPrintf(PETSC_COMM_SELF, vtk_fp, "</VTKFile>\n"));
-
-  PetscCall(PetscFree(buffer));
-  PetscCall(VecRestoreArray(l_FIELD, &_L_FIELD));
-  PetscCall(DMRestoreLocalVector(da, &l_FIELD));
-
-  if (vtk_fp) {
-    fclose(vtk_fp);
-    vtk_fp = NULL;
-  }
-  PetscFunctionReturn(PETSC_SUCCESS);
-}
-
-PetscErrorCode DAViewVTK_write_PieceExtend(FILE *vtk_fp, PetscInt indent_level,
-                                           DM da,
-                                           const char local_file_prefix[]) {
-  PetscMPIInt size, rank;
-  MPI_Comm comm;
-  const PetscInt *lx, *ly, *lz;
-  PetscInt M, N, P, pM, pN, pP, sum, *olx, *oly, *olz;
-  PetscInt *osx, *osy, *osz, *oex, *oey, *oez;
-  PetscInt i, j, k, II, stencil;
-
-  PetscFunctionBeginUser;
-  /* create file name */
-  PetscCall(PetscObjectGetComm((PetscObject)da, &comm));
-  PetscCallMPI(MPI_Comm_size(comm, &size));
-  PetscCallMPI(MPI_Comm_rank(comm, &rank));
-
-  PetscCall(
-      DMDAGetInfo(da, 0, &M, &N, &P, &pM, &pN, &pP, 0, &stencil, 0, 0, 0, 0));
-  PetscCall(DMDAGetOwnershipRanges(da, &lx, &ly, &lz));
-
-  /* generate start,end list */
-  PetscCall(PetscMalloc1(pM + 1, &olx));
-  PetscCall(PetscMalloc1(pN + 1, &oly));
-  PetscCall(PetscMalloc1(pP + 1, &olz));
-  sum = 0;
-  for (i = 0; i < pM; i++) {
-    olx[i] = sum;
-    sum = sum + lx[i];
-  }
-  olx[pM] = sum;
-  sum = 0;
-  for (i = 0; i < pN; i++) {
-    oly[i] = sum;
-    sum = sum + ly[i];
-  }
-  oly[pN] = sum;
-  sum = 0;
-  for (i = 0; i < pP; i++) {
-    olz[i] = sum;
-    sum = sum + lz[i];
-  }
-  olz[pP] = sum;
-
-  PetscCall(PetscMalloc1(pM, &osx));
-  PetscCall(PetscMalloc1(pN, &osy));
-  PetscCall(PetscMalloc1(pP, &osz));
-  PetscCall(PetscMalloc1(pM, &oex));
-  PetscCall(PetscMalloc1(pN, &oey));
-  PetscCall(PetscMalloc1(pP, &oez));
-  for (i = 0; i < pM; i++) {
-    osx[i] = olx[i] - stencil;
-    oex[i] = olx[i] + lx[i] + stencil;
-    if (osx[i] < 0)
-      osx[i] = 0;
-    if (oex[i] > M)
-      oex[i] = M;
-  }
-
-  for (i = 0; i < pN; i++) {
-    osy[i] = oly[i] - stencil;
-    oey[i] = oly[i] + ly[i] + stencil;
-    if (osy[i] < 0)
-      osy[i] = 0;
-    if (oey[i] > M)
-      oey[i] = N;
-  }
-  for (i = 0; i < pP; i++) {
-    osz[i] = olz[i] - stencil;
-    oez[i] = olz[i] + lz[i] + stencil;
-    if (osz[i] < 0)
-      osz[i] = 0;
-    if (oez[i] > P)
-      oez[i] = P;
-  }
-
-  for (k = 0; k < pP; k++) {
-    for (j = 0; j < pN; j++) {
-      for (i = 0; i < pM; i++) {
-        char name[PETSC_MAX_PATH_LEN];
-        PetscInt procid =
-            i + j * pM + k * pM * pN; /* convert proc(i,j,k) to pid */
-        PetscCall(PetscSNPrintf(name, sizeof(name),
-                                "subdomain-%s-p%1.4" PetscInt_FMT ".vts",
-                                local_file_prefix, procid));
-        for (II = 0; II < indent_level; II++)
-          PetscCall(PetscFPrintf(PETSC_COMM_SELF, vtk_fp, "  "));
-
-        PetscCall(PetscFPrintf(
-            PETSC_COMM_SELF, vtk_fp,
-            "<Piece Extent=\"%" PetscInt_FMT " %" PetscInt_FMT " %" PetscInt_FMT
-            " %" PetscInt_FMT " %" PetscInt_FMT " %" PetscInt_FMT
-            "\"      Source=\"%s\"/>\n",
-            osx[i], oex[i] - 1, osy[j], oey[j] - 1, osz[k], oez[k] - 1, name));
-      }
-    }
-  }
-  PetscCall(PetscFree(olx));
-  PetscCall(PetscFree(oly));
-  PetscCall(PetscFree(olz));
-  PetscCall(PetscFree(osx));
-  PetscCall(PetscFree(osy));
-  PetscCall(PetscFree(osz));
-  PetscCall(PetscFree(oex));
-  PetscCall(PetscFree(oey));
-  PetscCall(PetscFree(oez));
-  PetscFunctionReturn(PETSC_SUCCESS);
-}
-
-PetscErrorCode DAView_3DVTK_PStructuredGrid(DM da, const char file_prefix[],
-                                            const char local_file_prefix[]) {
-  MPI_Comm comm;
-  PetscMPIInt size, rank;
-  char vtk_filename[PETSC_MAX_PATH_LEN];
-  FILE *vtk_fp = NULL;
-  const char *byte_order =
-      PetscBinaryBigEndian() ? "BigEndian" : "LittleEndian";
-  PetscInt M, N, P, si, sj, sk, nx, ny, nz;
-  PetscInt i, dofs;
-
-  PetscFunctionBeginUser;
-  /* only rank-0 generates this file */
-  PetscCall(PetscObjectGetComm((PetscObject)da, &comm));
-  PetscCallMPI(MPI_Comm_size(comm, &size));
-  PetscCallMPI(MPI_Comm_rank(comm, &rank));
-
-  if (rank != 0)
-    PetscFunctionReturn(PETSC_SUCCESS);
-
-  /* create file name */
-  PetscCall(PetscSNPrintf(vtk_filename, sizeof(vtk_filename), "%s.pvts",
-                          file_prefix));
-  vtk_fp = fopen(vtk_filename, "w");
-  PetscCheck(vtk_fp, PETSC_COMM_SELF, PETSC_ERR_SYS, "Cannot open file = %s ",
-             vtk_filename);
-
-  /* (VTK) generate pvts header */
-  PetscCall(PetscFPrintf(PETSC_COMM_SELF, vtk_fp, "<?xml version=\"1.0\"?>\n"));
-
-  PetscCall(PetscFPrintf(
-      PETSC_COMM_SELF, vtk_fp,
-      "<VTKFile type=\"PStructuredGrid\" version=\"0.1\" byte_order=\"%s\">\n",
-      byte_order));
-
-  /* define size of the nodal mesh based on the cell DM */
-  PetscCall(DMDAGetInfo(da, 0, &M, &N, &P, 0, 0, 0, &dofs, 0, 0, 0, 0, 0));
-  PetscCall(DMDAGetGhostCorners(da, &si, &sj, &sk, &nx, &ny, &nz));
-  PetscCall(PetscFPrintf(
-      PETSC_COMM_SELF, vtk_fp,
-      "  <PStructuredGrid GhostLevel=\"1\" WholeExtent=\"%d %" PetscInt_FMT
-      " %d %" PetscInt_FMT " %d %" PetscInt_FMT "\">\n",
-      0, M - 1, 0, N - 1, 0, P - 1)); /* note overlap = 1 for Q1 */
-
-  /* DUMP THE CELL REFERENCES */
-  PetscCall(PetscFPrintf(PETSC_COMM_SELF, vtk_fp, "    <PCellData>\n"));
-  PetscCall(PetscFPrintf(PETSC_COMM_SELF, vtk_fp, "    </PCellData>\n"));
-
-  PetscCall(PetscFPrintf(PETSC_COMM_SELF, vtk_fp, "    <PPoints>\n"));
-  PetscCall(PetscFPrintf(PETSC_COMM_SELF, vtk_fp,
-                         "      <PDataArray type=\"Float64\" Name=\"Points\" "
-                         "NumberOfComponents=\"%d\"/>\n",
-                         NSD));
-  PetscCall(PetscFPrintf(PETSC_COMM_SELF, vtk_fp, "    </PPoints>\n"));
-
-  PetscCall(PetscFPrintf(PETSC_COMM_SELF, vtk_fp, "    <PPointData>\n"));
-  for (i = 0; i < dofs; i++) {
-    const char *fieldname;
-    PetscCall(DMDAGetFieldName(da, i, &fieldname));
-    PetscCall(PetscFPrintf(PETSC_COMM_SELF, vtk_fp,
-                           "      <PDataArray type=\"Float64\" Name=\"%s\" "
-                           "NumberOfComponents=\"1\"/>\n",
-                           fieldname));
-  }
-  PetscCall(PetscFPrintf(PETSC_COMM_SELF, vtk_fp, "    </PPointData>\n"));
-
-  /* write out the parallel information */
-  PetscCall(DAViewVTK_write_PieceExtend(vtk_fp, 2, da, local_file_prefix));
-
-  /* close the file */
-  PetscCall(PetscFPrintf(PETSC_COMM_SELF, vtk_fp, "  </PStructuredGrid>\n"));
-  PetscCall(PetscFPrintf(PETSC_COMM_SELF, vtk_fp, "</VTKFile>\n"));
-
-  if (vtk_fp) {
-    fclose(vtk_fp);
-    vtk_fp = NULL;
-  }
-  PetscFunctionReturn(PETSC_SUCCESS);
-}
-
-PetscErrorCode DAView3DPVTS(DM da, Vec x, const char NAME[]) {
-  char vts_filename[PETSC_MAX_PATH_LEN];
-  char pvts_filename[PETSC_MAX_PATH_LEN];
-
-  PetscFunctionBeginUser;
-  PetscCall(PetscSNPrintf(vts_filename, sizeof(vts_filename), "%s-mesh", NAME));
-  PetscCall(DAView_3DVTK_StructuredGrid_appended(da, x, vts_filename));
-
-  PetscCall(
-      PetscSNPrintf(pvts_filename, sizeof(pvts_filename), "%s-mesh", NAME));
-  PetscCall(DAView_3DVTK_PStructuredGrid(da, pvts_filename, vts_filename));
-  PetscFunctionReturn(PETSC_SUCCESS);
-}
-
-PetscErrorCode KSPMonitorStokesBlocks(KSP ksp, PetscInt n, PetscReal rnorm,
-                                      void *dummy) {
-  PetscReal norms[4];
-  Vec Br, v, w;
-  Mat A;
-
-  PetscFunctionBeginUser;
-  PetscCall(KSPGetOperators(ksp, &A, NULL));
-  PetscCall(MatCreateVecs(A, &w, &v));
-
-  PetscCall(KSPBuildResidual(ksp, v, w, &Br));
-
-  PetscCall(VecStrideNorm(Br, 0, NORM_2, &norms[0]));
-  PetscCall(VecStrideNorm(Br, 1, NORM_2, &norms[1]));
-  PetscCall(VecStrideNorm(Br, 2, NORM_2, &norms[2]));
-  PetscCall(VecStrideNorm(Br, 3, NORM_2, &norms[3]));
-
-  PetscCall(VecDestroy(&v));
-  PetscCall(VecDestroy(&w));
-
-  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
-                        "%3" PetscInt_FMT
-                        " KSP Component U,V,W,P residual norm [ %1.12e, "
-                        "%1.12e, %1.12e, %1.12e ]\n",
-                        n, (double)norms[0], (double)norms[1], (double)norms[2],
-                        (double)norms[3]));
-  PetscFunctionReturn(PETSC_SUCCESS);
-}
-
-static PetscErrorCode PCMGSetupViaCoarsen(PC pc, DM da_fine) {
-  PetscInt nlevels, k;
-  PETSC_UNUSED PetscInt finest;
-  DM *da_list, *daclist;
-  Mat R;
-
-  PetscFunctionBeginUser;
-  nlevels = 1;
-  PetscCall(PetscOptionsGetInt(NULL, NULL, "-levels", &nlevels, 0));
-
-  PetscCall(PetscMalloc1(nlevels, &da_list));
-  for (k = 0; k < nlevels; k++)
-    da_list[k] = NULL;
-  PetscCall(PetscMalloc1(nlevels, &daclist));
-  for (k = 0; k < nlevels; k++)
-    daclist[k] = NULL;
-
-  /* finest grid is nlevels - 1 */
-  finest = nlevels - 1;
-  daclist[0] = da_fine;
-  PetscCall(PetscObjectReference((PetscObject)da_fine));
-  PetscCall(DMCoarsenHierarchy(da_fine, nlevels - 1, &daclist[1]));
-  for (k = 0; k < nlevels; k++) {
-    da_list[k] = daclist[nlevels - 1 - k];
-    PetscCall(
-        DMDASetUniformCoordinates(da_list[k], 0.0, 1.0, 0.0, 1.0, 0.0, 1.0));
-  }
-
-  PetscCall(PCMGSetLevels(pc, nlevels, NULL));
-  PetscCall(PCMGSetType(pc, PC_MG_MULTIPLICATIVE));
-  PetscCall(PCMGSetGalerkin(pc, PC_MG_GALERKIN_PMAT));
-
-  for (k = 1; k < nlevels; k++) {
-    PetscCall(DMCreateInterpolation(da_list[k - 1], da_list[k], &R, NULL));
-    PetscCall(PCMGSetInterpolation(pc, k, R));
-    PetscCall(MatDestroy(&R));
-  }
-
-  /* tidy up */
-  for (k = 0; k < nlevels; k++)
-    PetscCall(DMDestroy(&da_list[k]));
-  PetscCall(PetscFree(da_list));
-  PetscCall(PetscFree(daclist));
-  PetscFunctionReturn(PETSC_SUCCESS);
-}
-
-static PetscErrorCode solve_stokes_3d_coupled(PetscInt mx, PetscInt my,
-                                              PetscInt mz) {
-  DM da_Stokes;
-  PetscInt u_dof, p_dof, dof, stencil_width;
-  Mat A, B;
-  DM vel_cda;
-  Vec vel_coords;
-  PetscInt p;
-  Vec f, X, X1;
-  DMDACoor3d ***_vel_coords;
-  PetscInt its;
-  KSP ksp_S;
-  PetscInt model_definition = 0;
-  PetscInt ei, ej, ek, sex, sey, sez, Imx, Jmy, Kmz;
-  CellProperties cell_properties;
-  PetscBool write_output = PETSC_FALSE, resolve = PETSC_FALSE;
-
-  PetscFunctionBeginUser;
-  PetscCall(PetscOptionsGetBool(NULL, NULL, "-resolve", &resolve, NULL));
-  /* Generate the da for velocity and pressure */
-  /* Num nodes in each direction is mx+1, my+1, mz+1 */
-  u_dof = U_DOFS; /* Vx, Vy - velocities */
-  p_dof = P_DOFS; /* p - pressure */
-  dof = u_dof + p_dof;
-  stencil_width = 1;
-  PetscCall(DMDACreate3d(PETSC_COMM_WORLD, DM_BOUNDARY_NONE, DM_BOUNDARY_NONE,
-                         DM_BOUNDARY_NONE, DMDA_STENCIL_BOX, mx + 1, my + 1,
-                         mz + 1, PETSC_DECIDE, PETSC_DECIDE, PETSC_DECIDE, dof,
-                         stencil_width, NULL, NULL, NULL, &da_Stokes));
-  PetscCall(DMSetMatType(da_Stokes, MATAIJ));
-  PetscCall(DMSetFromOptions(da_Stokes));
-  PetscCall(DMSetUp(da_Stokes));
-  PetscCall(DMDASetFieldName(da_Stokes, 0, "Vx"));
-  PetscCall(DMDASetFieldName(da_Stokes, 1, "Vy"));
-  PetscCall(DMDASetFieldName(da_Stokes, 2, "Vz"));
-  PetscCall(DMDASetFieldName(da_Stokes, 3, "P"));
-
-  /* unit box [0,1] x [0,1] x [0,1] */
-  PetscCall(DMDASetUniformCoordinates(da_Stokes, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0));
-
-  /* create quadrature point info for PDE coefficients */
-  PetscCall(CellPropertiesCreate(da_Stokes, &cell_properties));
-
-  /* interpolate the coordinates to quadrature points */
-  PetscCall(DMGetCoordinateDM(da_Stokes, &vel_cda));
-  PetscCall(DMGetCoordinatesLocal(da_Stokes, &vel_coords));
-  PetscCall(DMDAVecGetArray(vel_cda, vel_coords, &_vel_coords));
-  PetscCall(DMDAGetElementsCorners(da_Stokes, &sex, &sey, &sez));
-  PetscCall(DMDAGetElementsSizes(da_Stokes, &Imx, &Jmy, &Kmz));
-  for (ek = sez; ek < sez + Kmz; ek++) {
-    for (ej = sey; ej < sey + Jmy; ej++) {
-      for (ei = sex; ei < sex + Imx; ei++) {
-        /* get coords for the element */
-        PetscInt ngp;
-        PetscScalar gp_xi[GAUSS_POINTS][NSD], gp_weight[GAUSS_POINTS];
-        PetscScalar el_coords[NSD * NODES_PER_EL];
-        GaussPointCoefficients *cell;
-
-        PetscCall(CellPropertiesGetCell(cell_properties, ei, ej, ek, &cell));
-        PetscCall(GetElementCoords3D(_vel_coords, ei, ej, ek, el_coords));
-        ConstructGaussQuadrature3D(&ngp, gp_xi, gp_weight);
-
-        for (p = 0; p < GAUSS_POINTS; p++) {
-          PetscScalar xi_p[NSD], Ni_p[NODES_PER_EL];
-          PetscScalar gp_x, gp_y, gp_z;
-          PetscInt n;
-
-          xi_p[0] = gp_xi[p][0];
-          xi_p[1] = gp_xi[p][1];
-          xi_p[2] = gp_xi[p][2];
-          ShapeFunctionQ13D_Evaluate(xi_p, Ni_p);
-
-          gp_x = gp_y = gp_z = 0.0;
-          for (n = 0; n < NODES_PER_EL; n++) {
-            gp_x = gp_x + Ni_p[n] * el_coords[NSD * n];
-            gp_y = gp_y + Ni_p[n] * el_coords[NSD * n + 1];
-            gp_z = gp_z + Ni_p[n] * el_coords[NSD * n + 2];
-          }
-          cell->gp_coords[NSD * p] = gp_x;
-          cell->gp_coords[NSD * p + 1] = gp_y;
-          cell->gp_coords[NSD * p + 2] = gp_z;
-        }
-      }
-    }
-  }
-
-  PetscCall(PetscOptionsGetInt(NULL, NULL, "-model", &model_definition, NULL));
-
-  switch (model_definition) {
-  case 0: /* isoviscous */
-    for (ek = sez; ek < sez + Kmz; ek++) {
-      for (ej = sey; ej < sey + Jmy; ej++) {
-        for (ei = sex; ei < sex + Imx; ei++) {
-          GaussPointCoefficients *cell;
-
-          PetscCall(CellPropertiesGetCell(cell_properties, ei, ej, ek, &cell));
-          for (p = 0; p < GAUSS_POINTS; p++) {
-            PetscReal coord_x = PetscRealPart(cell->gp_coords[NSD * p]);
-            PetscReal coord_y = PetscRealPart(cell->gp_coords[NSD * p + 1]);
-            PetscReal coord_z = PetscRealPart(cell->gp_coords[NSD * p + 2]);
-
-            cell->eta[p] = 1.0;
-
-            cell->fx[p] = 0.0 * coord_x;
-            cell->fy[p] = -PetscSinReal(2.2 * PETSC_PI * coord_y) *
-                          PetscCosReal(1.0 * PETSC_PI * coord_x);
-            cell->fz[p] = 0.0 * coord_z;
-            cell->hc[p] = 0.0;
-          }
-        }
-      }
-    }
-    break;
-
-  case 1: /* manufactured */
-    for (ek = sez; ek < sez + Kmz; ek++) {
-      for (ej = sey; ej < sey + Jmy; ej++) {
-        for (ei = sex; ei < sex + Imx; ei++) {
-          PetscReal eta, Fm[NSD], Fc, pos[NSD];
-          GaussPointCoefficients *cell;
-
-          PetscCall(CellPropertiesGetCell(cell_properties, ei, ej, ek, &cell));
-          for (p = 0; p < GAUSS_POINTS; p++) {
-            PetscReal coord_x = PetscRealPart(cell->gp_coords[NSD * p]);
-            PetscReal coord_y = PetscRealPart(cell->gp_coords[NSD * p + 1]);
-            PetscReal coord_z = PetscRealPart(cell->gp_coords[NSD * p + 2]);
-
-            pos[0] = coord_x;
-            pos[1] = coord_y;
-            pos[2] = coord_z;
-
-            evaluate_MS_FrankKamentski(pos, NULL, NULL, &eta, Fm, &Fc);
-            cell->eta[p] = eta;
-
-            cell->fx[p] = Fm[0];
-            cell->fy[p] = Fm[1];
-            cell->fz[p] = Fm[2];
-            cell->hc[p] = Fc;
-          }
-        }
-      }
-    }
-    break;
-
-  case 2: /* solcx */
-    for (ek = sez; ek < sez + Kmz; ek++) {
-      for (ej = sey; ej < sey + Jmy; ej++) {
-        for (ei = sex; ei < sex + Imx; ei++) {
-          GaussPointCoefficients *cell;
-
-          PetscCall(CellPropertiesGetCell(cell_properties, ei, ej, ek, &cell));
-          for (p = 0; p < GAUSS_POINTS; p++) {
-            PetscReal coord_x = PetscRealPart(cell->gp_coords[NSD * p]);
-            PetscReal coord_y = PetscRealPart(cell->gp_coords[NSD * p + 1]);
-            PetscReal coord_z = PetscRealPart(cell->gp_coords[NSD * p + 2]);
-
-            cell->eta[p] = 1.0;
-
-            cell->fx[p] = 0.0;
-            cell->fy[p] = -PetscSinReal(3.0 * PETSC_PI * coord_y) *
-                          PetscCosReal(1.0 * PETSC_PI * coord_x);
-            cell->fz[p] = 0.0 * coord_z;
-            cell->hc[p] = 0.0;
-          }
-        }
-      }
-    }
-    break;
-
-  case 3: /* sinker */
-    for (ek = sez; ek < sez + Kmz; ek++) {
-      for (ej = sey; ej < sey + Jmy; ej++) {
-        for (ei = sex; ei < sex + Imx; ei++) {
-          GaussPointCoefficients *cell;
-
-          PetscCall(CellPropertiesGetCell(cell_properties, ei, ej, ek, &cell));
-          for (p = 0; p < GAUSS_POINTS; p++) {
-            PetscReal xp = PetscRealPart(cell->gp_coords[NSD * p]);
-            PetscReal yp = PetscRealPart(cell->gp_coords[NSD * p + 1]);
-            PetscReal zp = PetscRealPart(cell->gp_coords[NSD * p + 2]);
-
-            cell->eta[p] = 1.0e-2;
-            cell->fx[p] = 0.0;
-            cell->fy[p] = 0.0;
-            cell->fz[p] = 0.0;
-            cell->hc[p] = 0.0;
-
-            if ((PetscAbs(xp - 0.5) < 0.2) && (PetscAbs(yp - 0.5) < 0.2) &&
-                (PetscAbs(zp - 0.5) < 0.2)) {
-              cell->eta[p] = 1.0;
-              cell->fz[p] = 1.0;
-            }
-          }
-        }
-      }
-    }
-    break;
-
-  case 4: /* subdomain jumps */
-    for (ek = sez; ek < sez + Kmz; ek++) {
-      for (ej = sey; ej < sey + Jmy; ej++) {
-        for (ei = sex; ei < sex + Imx; ei++) {
-          PetscReal opts_mag, opts_eta0;
-          PetscInt px, py, pz;
-          PetscBool jump;
-          PetscMPIInt rr;
-          GaussPointCoefficients *cell;
-
-          opts_mag = 1.0;
-          opts_eta0 = 1.e-2;
-
-          PetscCall(
-              PetscOptionsGetReal(NULL, NULL, "-jump_eta0", &opts_eta0, NULL));
-          PetscCall(PetscOptionsGetReal(NULL, NULL, "-jump_magnitude",
-                                        &opts_mag, NULL));
-          PetscCall(DMDAGetInfo(da_Stokes, NULL, NULL, NULL, NULL, &px, &py,
-                                &pz, NULL, NULL, NULL, NULL, NULL, NULL));
-          rr = PetscGlobalRank % (px * py);
-          if (px % 2)
-            jump = (PetscBool)(rr % 2);
-          else
-            jump = (PetscBool)((rr / px) % 2 ? rr % 2 : !(rr % 2));
-          rr = PetscGlobalRank / (px * py);
-          if (rr % 2)
-            jump = (PetscBool)!jump;
-          PetscCall(CellPropertiesGetCell(cell_properties, ei, ej, ek, &cell));
-          for (p = 0; p < GAUSS_POINTS; p++) {
-            PetscReal xp = PetscRealPart(cell->gp_coords[NSD * p]);
-            PetscReal yp = PetscRealPart(cell->gp_coords[NSD * p + 1]);
-
-            cell->eta[p] = jump ? PetscPowReal(10.0, opts_mag) : opts_eta0;
-            cell->fx[p] = 0.0;
-            cell->fy[p] = -PetscSinReal(2.2 * PETSC_PI * yp) *
-                          PetscCosReal(1.0 * PETSC_PI * xp);
-            cell->fz[p] = 0.0;
-            cell->hc[p] = 0.0;
-          }
-        }
-      }
-    }
-    break;
-  default:
-    SETERRQ(PETSC_COMM_WORLD, PETSC_ERR_SUP,
-            "No default model is supported. Choose either -model {0,1,2,3}");
-  }
-
-  PetscCall(DMDAVecRestoreArray(vel_cda, vel_coords, &_vel_coords));
-
-  /* Generate a matrix with the correct non-zero pattern of type AIJ. This will
-   * work in parallel and serial */
-  PetscCall(DMCreateMatrix(da_Stokes, &A));
-  PetscCall(DMCreateMatrix(da_Stokes, &B));
-  PetscCall(DMCreateGlobalVector(da_Stokes, &X));
-  PetscCall(DMCreateGlobalVector(da_Stokes, &f));
-
-  /* assemble A11 */
-  PetscCall(MatZeroEntries(A));
-  PetscCall(MatZeroEntries(B));
-  PetscCall(VecZeroEntries(f));
-
-  PetscCall(AssembleA_Stokes(A, da_Stokes, cell_properties));
-  PetscCall(MatViewFromOptions(A, NULL, "-amat_view"));
-  PetscCall(AssembleA_PCStokes(B, da_Stokes, cell_properties));
-  PetscCall(MatViewFromOptions(B, NULL, "-bmat_view"));
-  /* build force vector */
-  PetscCall(AssembleF_Stokes(f, da_Stokes, cell_properties));
-
-  /* SOLVE */
-  PetscCall(KSPCreate(PETSC_COMM_WORLD, &ksp_S));
-  PetscCall(KSPSetOptionsPrefix(ksp_S, "stokes_"));
-  PetscCall(KSPSetOperators(ksp_S, A, B));
-  PetscCall(KSPSetFromOptions(ksp_S));
-
-  {
-    PC pc;
-    const PetscInt ufields[] = {0, 1, 2}, pfields[] = {3};
-    PetscCall(KSPGetPC(ksp_S, &pc));
-    PetscCall(PCFieldSplitSetBlockSize(pc, 4));
-    PetscCall(PCFieldSplitSetFields(pc, "u", 3, ufields, ufields));
-    PetscCall(PCFieldSplitSetFields(pc, "p", 1, pfields, pfields));
-  }
-
-  {
-    PC pc;
-    PetscBool same = PETSC_FALSE;
-    PetscCall(KSPGetPC(ksp_S, &pc));
-    PetscCall(PetscObjectTypeCompare((PetscObject)pc, PCMG, &same));
-    if (same)
-      PetscCall(PCMGSetupViaCoarsen(pc, da_Stokes));
-  }
-
-  {
-    PC pc;
-    PetscBool same = PETSC_FALSE;
-    PetscCall(KSPGetPC(ksp_S, &pc));
-    PetscCall(PetscObjectTypeCompare((PetscObject)pc, PCBDDC, &same));
-    if (same)
-      PetscCall(KSPSetOperators(ksp_S, A, A));
-  }
-
-  {
-    PetscBool stokes_monitor = PETSC_FALSE;
-    PetscCall(PetscOptionsGetBool(NULL, NULL, "-stokes_ksp_monitor_blocks",
-                                  &stokes_monitor, 0));
-    if (stokes_monitor)
-      PetscCall(KSPMonitorSet(ksp_S, KSPMonitorStokesBlocks, NULL, NULL));
-  }
-
-  if (resolve) {
-    /* Test changing matrix data structure and resolve */
-    PetscCall(VecDuplicate(X, &X1));
-  }
-
-  PetscCall(KSPSolve(ksp_S, f, X));
-  if (resolve) {
-    Mat C;
-    PetscCall(MatDuplicate(A, MAT_COPY_VALUES, &C));
-    PetscCall(KSPSetOperators(ksp_S, C, C));
-    PetscCall(KSPSolve(ksp_S, f, X1));
-    PetscCall(MatDestroy(&C));
-    PetscCall(VecDestroy(&X1));
-  }
-
-  PetscCall(
-      PetscOptionsGetBool(NULL, NULL, "-write_pvts", &write_output, NULL));
-  if (write_output)
-    PetscCall(DAView3DPVTS(da_Stokes, X, "up"));
-  {
-    PetscBool flg = PETSC_FALSE;
-    char filename[PETSC_MAX_PATH_LEN];
-    PetscCall(PetscOptionsGetString(NULL, NULL, "-write_binary", filename,
-                                    sizeof(filename), &flg));
-    if (flg) {
-      PetscViewer viewer;
-      /* PetscCall(PetscViewerBinaryOpen(PETSC_COMM_WORLD,filename[0]?filename:"ex42-binaryoutput",FILE_MODE_WRITE,&viewer));
-       */
-      PetscCall(PetscViewerVTKOpen(PETSC_COMM_WORLD, "ex42.vts",
-                                   FILE_MODE_WRITE, &viewer));
-      PetscCall(VecView(X, viewer));
-      PetscCall(PetscViewerDestroy(&viewer));
-    }
-  }
-  PetscCall(KSPGetIterationNumber(ksp_S, &its));
-
-  /* verify */
-  if (model_definition == 1) {
-    DM da_Stokes_analytic;
-    Vec X_analytic;
-
-    PetscCall(DMDACreateManufacturedSolution(mx, my, mz, &da_Stokes_analytic,
-                                             &X_analytic));
-    if (write_output)
-      PetscCall(DAView3DPVTS(da_Stokes_analytic, X_analytic, "ms"));
-    PetscCall(DMDAIntegrateErrors3D(da_Stokes_analytic, X, X_analytic));
-    if (write_output)
-      PetscCall(DAView3DPVTS(da_Stokes, X, "up2"));
-    PetscCall(DMDestroy(&da_Stokes_analytic));
-    PetscCall(VecDestroy(&X_analytic));
-  }
-
-  PetscCall(KSPDestroy(&ksp_S));
-  PetscCall(VecDestroy(&X));
-  PetscCall(VecDestroy(&f));
+  /* Dump solution by converting to DMDAs and dumping */
+  if (dump_solution)
+    PetscCall(DumpSolution(ctx, ctx->n_levels - 1, x));
+
+  /* Destroy PETSc objects and finalize */
   PetscCall(MatDestroy(&A));
-  PetscCall(MatDestroy(&B));
-
-  PetscCall(CellPropertiesDestroy(&cell_properties));
-  PetscCall(DMDestroy(&da_Stokes));
-  PetscFunctionReturn(PETSC_SUCCESS);
-}
-
-int main(int argc, char **args) {
-  PetscInt mx, my, mz;
-
-  PetscFunctionBeginUser;
-  PetscCall(PetscInitialize(&argc, &args, (char *)0, help));
-  mx = my = mz = 10;
-  PetscCall(PetscOptionsGetInt(NULL, NULL, "-mx", &mx, NULL));
-  my = mx;
-  mz = mx;
-  PetscCall(PetscOptionsGetInt(NULL, NULL, "-my", &my, NULL));
-  PetscCall(PetscOptionsGetInt(NULL, NULL, "-mz", &mz, NULL));
-  PetscCall(solve_stokes_3d_coupled(mx, my, mz));
+  PetscCall(PetscFree(A));
+  if (A_faces) {
+    for (PetscInt level = 0; level < ctx->n_levels; ++level) {
+      if (A_faces[level])
+        PetscCall(MatDestroy(&A_faces[level]));
+    }
+    PetscCall(PetscFree(A_faces));
+  }
+  if (P)
+    PetscCall(MatDestroy(&P));
+  PetscCall(VecDestroy(&x));
+  PetscCall(VecDestroy(&b));
+  PetscCall(MatDestroy(&S_hat));
+  PetscCall(KSPDestroy(&ksp));
+  PetscCall(CtxDestroy(&ctx));
   PetscCall(PetscFinalize());
   return 0;
+}
+
+static PetscScalar GetEta_constant(Ctx ctx, PetscScalar x, PetscScalar y,
+                                   PetscScalar z) {
+  (void)ctx;
+  (void)x;
+  (void)y;
+  (void)z;
+  return 1.0;
+}
+
+static PetscScalar GetRho_layers(Ctx ctx, PetscScalar x, PetscScalar y,
+                                 PetscScalar z) {
+  (void)y;
+  (void)z;
+  return PetscRealPart(x) < (ctx->xmax - ctx->xmin) / 2.0 ? ctx->rho1
+                                                          : ctx->rho2;
+}
+
+static PetscScalar GetEta_layers(Ctx ctx, PetscScalar x, PetscScalar y,
+                                 PetscScalar z) {
+  (void)y;
+  (void)z;
+  return PetscRealPart(x) < (ctx->xmax - ctx->xmin) / 2.0 ? ctx->eta1
+                                                          : ctx->eta2;
+}
+
+static PetscScalar GetRho_sinker_box2(Ctx ctx, PetscScalar x, PetscScalar y,
+                                      PetscScalar z) {
+  (void)z;
+  const PetscReal d = ctx->xmax - ctx->xmin;
+  const PetscReal xx = PetscRealPart(x) / d - 0.5;
+  const PetscReal yy = PetscRealPart(y) / d - 0.5;
+  return (xx * xx > 0.15 * 0.15 || yy * yy > 0.15 * 0.15) ? ctx->rho1
+                                                          : ctx->rho2;
+}
+
+static PetscScalar GetEta_sinker_box2(Ctx ctx, PetscScalar x, PetscScalar y,
+                                      PetscScalar z) {
+  (void)z;
+  const PetscReal d = ctx->xmax - ctx->xmin;
+  const PetscReal xx = PetscRealPart(x) / d - 0.5;
+  const PetscReal yy = PetscRealPart(y) / d - 0.5;
+  return (xx * xx > 0.15 * 0.15 || yy * yy > 0.15 * 0.15) ? ctx->eta1
+                                                          : ctx->eta2;
+}
+
+static PetscScalar GetRho_sinker_box3(Ctx ctx, PetscScalar x, PetscScalar y,
+                                      PetscScalar z) {
+  const PetscReal d = ctx->xmax - ctx->xmin;
+  const PetscReal xx = PetscRealPart(x) / d - 0.5;
+  const PetscReal yy = PetscRealPart(y) / d - 0.5;
+  const PetscReal zz = PetscRealPart(z) / d - 0.5;
+  const PetscReal half_width = 0.15;
+  return (PetscAbsReal(xx) > half_width || PetscAbsReal(yy) > half_width ||
+          PetscAbsReal(zz) > half_width)
+             ? ctx->rho1
+             : ctx->rho2;
+}
+
+static PetscScalar GetEta_sinker_box3(Ctx ctx, PetscScalar x, PetscScalar y,
+                                      PetscScalar z) {
+  const PetscReal d = ctx->xmax - ctx->xmin;
+  const PetscReal xx = PetscRealPart(x) / d - 0.5;
+  const PetscReal yy = PetscRealPart(y) / d - 0.5;
+  const PetscReal zz = PetscRealPart(z) / d - 0.5;
+  const PetscReal half_width = 0.15;
+  return (PetscAbsReal(xx) > half_width || PetscAbsReal(yy) > half_width ||
+          PetscAbsReal(zz) > half_width)
+             ? ctx->eta1
+             : ctx->eta2;
+}
+
+static PetscScalar GetRho_sinker_sphere3(Ctx ctx, PetscScalar x, PetscScalar y,
+                                         PetscScalar z) {
+  const PetscReal d = ctx->xmax - ctx->xmin;
+  const PetscReal xx = PetscRealPart(x) / d - 0.5;
+  const PetscReal yy = PetscRealPart(y) / d - 0.5;
+  const PetscReal zz = PetscRealPart(z) / d - 0.5;
+  const PetscReal half_width = 0.3;
+  return (xx * xx + yy * yy + zz * zz > half_width * half_width) ? ctx->rho1
+                                                                 : ctx->rho2;
+}
+
+static PetscScalar GetEta_sinker_sphere3(Ctx ctx, PetscScalar x, PetscScalar y,
+                                         PetscScalar z) {
+  const PetscReal d = ctx->xmax - ctx->xmin;
+  const PetscReal xx = PetscRealPart(x) / d - 0.5;
+  const PetscReal yy = PetscRealPart(y) / d - 0.5;
+  const PetscReal zz = PetscRealPart(z) / d - 0.5;
+  const PetscReal half_width = 0.3;
+  return (xx * xx + yy * yy + zz * zz > half_width * half_width) ? ctx->eta1
+                                                                 : ctx->eta2;
+}
+
+static PetscScalar GetEta_blob3(Ctx ctx, PetscScalar x, PetscScalar y,
+                                PetscScalar z) {
+  const PetscReal d = ctx->xmax - ctx->xmin;
+  const PetscReal xx = PetscRealPart(x) / d - 0.5;
+  const PetscReal yy = PetscRealPart(y) / d - 0.5;
+  const PetscReal zz = PetscRealPart(z) / d - 0.5;
+  return ctx->eta1 +
+         ctx->eta2 * PetscExpScalar(-20.0 * (xx * xx + yy * yy + zz * zz));
+}
+
+static PetscScalar GetRho_blob3(Ctx ctx, PetscScalar x, PetscScalar y,
+                                PetscScalar z) {
+  const PetscReal d = ctx->xmax - ctx->xmin;
+  const PetscReal xx = PetscRealPart(x) / d - 0.5;
+  const PetscReal yy = PetscRealPart(y) / d - 0.5;
+  const PetscReal zz = PetscRealPart(z) / d - 0.5;
+  return ctx->rho1 +
+         ctx->rho2 * PetscExpScalar(-20.0 * (xx * xx + yy * yy + zz * zz));
+}
+
+static PetscErrorCode LevelCtxCreate(LevelCtx *p_level_ctx) {
+  LevelCtx level_ctx;
+
+  PetscFunctionBeginUser;
+  PetscCall(PetscMalloc1(1, p_level_ctx));
+  level_ctx = *p_level_ctx;
+  level_ctx->dm_stokes = NULL;
+  level_ctx->dm_coefficients = NULL;
+  level_ctx->dm_faces = NULL;
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode LevelCtxDestroy(LevelCtx *p_level_ctx) {
+  LevelCtx level_ctx;
+
+  PetscFunctionBeginUser;
+  level_ctx = *p_level_ctx;
+  if (level_ctx->dm_stokes)
+    PetscCall(DMDestroy(&level_ctx->dm_stokes));
+  if (level_ctx->dm_coefficients)
+    PetscCall(DMDestroy(&level_ctx->dm_coefficients));
+  if (level_ctx->dm_faces)
+    PetscCall(DMDestroy(&level_ctx->dm_faces));
+  if (level_ctx->coeff)
+    PetscCall(VecDestroy(&level_ctx->coeff));
+  PetscCall(PetscFree(*p_level_ctx));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode CtxCreateAndSetFromOptions(Ctx *p_ctx) {
+  Ctx ctx;
+
+  PetscFunctionBeginUser;
+  PetscCall(PetscMalloc1(1, p_ctx));
+  ctx = *p_ctx;
+
+  ctx->comm = PETSC_COMM_WORLD;
+  ctx->pin_pressure = PETSC_FALSE;
+  PetscCall(PetscOptionsGetBool(NULL, NULL, "-pin_pressure", &ctx->pin_pressure,
+                                NULL));
+  ctx->dim = 3;
+  PetscCall(PetscOptionsGetInt(NULL, NULL, "-dim", &ctx->dim, NULL));
+  if (ctx->dim <= 2) {
+    ctx->cells_x = 32;
+  } else {
+    ctx->cells_x = 16;
+  }
+  PetscCall(
+      PetscOptionsGetInt(NULL, NULL, "-s", &ctx->cells_x,
+                         NULL)); /* shortcut. Usually, use -stag_grid_x etc. */
+  ctx->cells_z = ctx->cells_y = ctx->cells_x;
+  ctx->xmin = ctx->ymin = ctx->zmin = 0.0;
+  {
+    PetscBool nondimensional = PETSC_TRUE;
+
+    PetscCall(PetscOptionsGetBool(NULL, NULL, "-nondimensional",
+                                  &nondimensional, NULL));
+    if (nondimensional) {
+      ctx->xmax = ctx->ymax = ctx->zmax = 1.0;
+      ctx->rho1 = 0.0;
+      ctx->rho2 = 1.0;
+      ctx->eta1 = 1.0;
+      ctx->eta2 = 1e2;
+      ctx->gy = -1.0; /* downwards */
+    } else {
+      ctx->xmax = 1e6;
+      ctx->ymax = 1.5e6;
+      ctx->zmax = 1e6;
+      ctx->rho1 = 3200;
+      ctx->rho2 = 3300;
+      ctx->eta1 = 1e20;
+      ctx->eta2 = 1e22;
+      ctx->gy = -10.0; /* downwards */
+    }
+  }
+  {
+    PetscBool isoviscous;
+
+    isoviscous = PETSC_FALSE;
+    PetscCall(PetscOptionsGetScalar(NULL, NULL, "-eta1", &ctx->eta1, NULL));
+    PetscCall(
+        PetscOptionsGetBool(NULL, NULL, "-isoviscous", &isoviscous, NULL));
+    if (isoviscous) {
+      ctx->eta2 = ctx->eta1;
+      ctx->GetEta = GetEta_constant; /* override */
+    } else {
+      PetscCall(PetscOptionsGetScalar(NULL, NULL, "-eta2", &ctx->eta2, NULL));
+    }
+  }
+  {
+    char mode[1024] = "sinker";
+    PetscBool is_layers, is_blob, is_sinker_box, is_sinker_sphere;
+
+    PetscCall(PetscOptionsGetString(NULL, NULL, "-coefficients", mode,
+                                    sizeof(mode), NULL));
+    PetscCall(PetscStrncmp(mode, "layers", sizeof(mode), &is_layers));
+    PetscCall(PetscStrncmp(mode, "sinker", sizeof(mode), &is_sinker_box));
+    if (!is_sinker_box)
+      PetscCall(PetscStrncmp(mode, "sinker_box", sizeof(mode), &is_sinker_box));
+    PetscCall(
+        PetscStrncmp(mode, "sinker_sphere", sizeof(mode), &is_sinker_sphere));
+    PetscCall(PetscStrncmp(mode, "blob", sizeof(mode), &is_blob));
+
+    if (is_layers) {
+      ctx->GetRho = GetRho_layers;
+      ctx->GetEta = GetEta_layers;
+    }
+    if (is_blob) {
+      if (ctx->dim == 3) {
+        ctx->GetRho = GetRho_blob3;
+        ctx->GetEta = GetEta_blob3;
+      } else
+        SETERRQ(PETSC_COMM_WORLD, PETSC_ERR_SUP,
+                "Not implemented for dimension %" PetscInt_FMT, ctx->dim);
+    }
+    if (is_sinker_box) {
+      if (ctx->dim == 2) {
+        ctx->GetRho = GetRho_sinker_box2;
+        ctx->GetEta = GetEta_sinker_box2;
+      } else if (ctx->dim == 3) {
+        ctx->GetRho = GetRho_sinker_box3;
+        ctx->GetEta = GetEta_sinker_box3;
+      } else
+        SETERRQ(PETSC_COMM_WORLD, PETSC_ERR_SUP,
+                "Not implemented for dimension %" PetscInt_FMT, ctx->dim);
+    }
+    if (is_sinker_sphere) {
+      if (ctx->dim == 3) {
+        ctx->GetRho = GetRho_sinker_sphere3;
+        ctx->GetEta = GetEta_sinker_sphere3;
+      } else
+        SETERRQ(PETSC_COMM_WORLD, PETSC_ERR_SUP,
+                "Not implemented for dimension %" PetscInt_FMT, ctx->dim);
+    }
+  }
+
+  /* Per-level data */
+  ctx->n_levels = 1;
+  PetscCall(PetscOptionsGetInt(NULL, NULL, "-levels", &ctx->n_levels, NULL));
+  PetscCall(PetscMalloc1(ctx->n_levels, &ctx->levels));
+  for (PetscInt i = 0; i < ctx->n_levels; ++i)
+    PetscCall(LevelCtxCreate(&ctx->levels[i]));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode CtxDestroy(Ctx *p_ctx) {
+  Ctx ctx;
+
+  PetscFunctionBeginUser;
+  ctx = *p_ctx;
+  for (PetscInt i = 0; i < ctx->n_levels; ++i)
+    PetscCall(LevelCtxDestroy(&ctx->levels[i]));
+  PetscCall(PetscFree(ctx->levels));
+  PetscCall(PetscFree(*p_ctx));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode SystemParametersCreate(SystemParameters *parameters,
+                                             Ctx ctx) {
+  PetscFunctionBeginUser;
+  PetscCall(PetscMalloc1(1, parameters));
+  (*parameters)->ctx = ctx;
+  (*parameters)->level = ctx->n_levels - 1;
+  (*parameters)->include_inverse_visc = PETSC_FALSE;
+  (*parameters)->faces_only = PETSC_FALSE;
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode SystemParametersDestroy(SystemParameters *parameters) {
+  PetscFunctionBeginUser;
+  PetscCall(PetscFree(*parameters));
+  *parameters = NULL;
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode CreateSystem2d(SystemParameters parameters, Mat *pA,
+                                     Vec *pRhs) {
+  PetscInt N[2];
+  PetscInt ex, ey, startx, starty, nx, ny;
+  Mat A;
+  Vec rhs;
+  PetscReal hx, hy, dv;
+  Vec coefficients_local;
+  PetscBool build_rhs;
+  DM dm_main, dm_coefficients;
+  PetscScalar K_cont, K_bound;
+  Ctx ctx = parameters->ctx;
+  PetscInt level = parameters->level;
+
+  PetscFunctionBeginUser;
+  if (parameters->faces_only) {
+    dm_main = ctx->levels[level]->dm_faces;
+  } else {
+    dm_main = ctx->levels[level]->dm_stokes;
+  }
+  dm_coefficients = ctx->levels[level]->dm_coefficients;
+  K_cont = ctx->levels[level]->K_cont;
+  K_bound = ctx->levels[level]->K_bound;
+  PetscCall(DMCreateMatrix(dm_main, pA));
+  A = *pA;
+  build_rhs = (PetscBool)(pRhs != NULL);
+  PetscCheck(!(parameters->faces_only && build_rhs),
+             PetscObjectComm((PetscObject)dm_main), PETSC_ERR_SUP,
+             "RHS for faces-only not supported");
+  if (build_rhs) {
+    PetscCall(DMCreateGlobalVector(dm_main, pRhs));
+    rhs = *pRhs;
+  } else {
+    rhs = NULL;
+  }
+  PetscCall(DMStagGetCorners(dm_main, &startx, &starty, NULL, &nx, &ny, NULL,
+                             NULL, NULL, NULL));
+  PetscCall(DMStagGetGlobalSizes(dm_main, &N[0], &N[1], NULL));
+  hx = ctx->levels[level]->hx_characteristic;
+  hy = ctx->levels[level]->hy_characteristic;
+  dv = hx * hy;
+  PetscCall(DMGetLocalVector(dm_coefficients, &coefficients_local));
+  PetscCall(DMGlobalToLocal(dm_coefficients, ctx->levels[level]->coeff,
+                            INSERT_VALUES, coefficients_local));
+
+  /* Loop over all local elements */
+  for (ey = starty; ey < starty + ny;
+       ++ey) { /* With DMStag, always iterate x fastest, y second fastest, z
+                  slowest */
+    for (ex = startx; ex < startx + nx; ++ex) {
+      const PetscBool left_boundary = (PetscBool)(ex == 0);
+      const PetscBool right_boundary = (PetscBool)(ex == N[0] - 1);
+      const PetscBool bottom_boundary = (PetscBool)(ey == 0);
+      const PetscBool top_boundary = (PetscBool)(ey == N[1] - 1);
+
+      if (ey == N[1] - 1) {
+        /* Top boundary velocity Dirichlet */
+        DMStagStencil row;
+        const PetscScalar val_rhs = 0.0;
+        const PetscScalar val_A = K_bound;
+
+        row.i = ex;
+        row.j = ey;
+        row.loc = DMSTAG_UP;
+        row.c = 0;
+        PetscCall(DMStagMatSetValuesStencil(dm_main, A, 1, &row, 1, &row,
+                                            &val_A, INSERT_VALUES));
+        if (build_rhs)
+          PetscCall(DMStagVecSetValuesStencil(dm_main, rhs, 1, &row, &val_rhs,
+                                              INSERT_VALUES));
+      }
+
+      if (ey == 0) {
+        /* Bottom boundary velocity Dirichlet */
+        DMStagStencil row;
+        const PetscScalar val_rhs = 0.0;
+        const PetscScalar val_A = K_bound;
+
+        row.i = ex;
+        row.j = ey;
+        row.loc = DMSTAG_DOWN;
+        row.c = 0;
+        PetscCall(DMStagMatSetValuesStencil(dm_main, A, 1, &row, 1, &row,
+                                            &val_A, INSERT_VALUES));
+        if (build_rhs)
+          PetscCall(DMStagVecSetValuesStencil(dm_main, rhs, 1, &row, &val_rhs,
+                                              INSERT_VALUES));
+      } else {
+        /* Y-momentum equation : (u_xx + u_yy) - p_y = f^y
+           includes non-zero forcing and free-slip boundary conditions */
+        PetscInt count;
+        DMStagStencil row, col[11];
+        PetscScalar val_A[11];
+        DMStagStencil rhoPoint[2];
+        PetscScalar rho[2], val_rhs;
+        DMStagStencil etaPoint[4];
+        PetscScalar eta[4], eta_left, eta_right, eta_up, eta_down;
+
+        row.i = ex;
+        row.j = ey;
+        row.loc = DMSTAG_DOWN;
+        row.c = 0;
+
+        /* get rho values  and compute rhs value*/
+        rhoPoint[0].i = ex;
+        rhoPoint[0].j = ey;
+        rhoPoint[0].loc = DMSTAG_DOWN_LEFT;
+        rhoPoint[0].c = 1;
+        rhoPoint[1].i = ex;
+        rhoPoint[1].j = ey;
+        rhoPoint[1].loc = DMSTAG_DOWN_RIGHT;
+        rhoPoint[1].c = 1;
+        PetscCall(DMStagVecGetValuesStencil(dm_coefficients, coefficients_local,
+                                            2, rhoPoint, rho));
+        val_rhs = -ctx->gy * dv * 0.5 * (rho[0] + rho[1]);
+
+        /* Get eta values */
+        etaPoint[0].i = ex;
+        etaPoint[0].j = ey;
+        etaPoint[0].loc = DMSTAG_DOWN_LEFT;
+        etaPoint[0].c = 0; /* Left  */
+        etaPoint[1].i = ex;
+        etaPoint[1].j = ey;
+        etaPoint[1].loc = DMSTAG_DOWN_RIGHT;
+        etaPoint[1].c = 0; /* Right */
+        etaPoint[2].i = ex;
+        etaPoint[2].j = ey;
+        etaPoint[2].loc = DMSTAG_ELEMENT;
+        etaPoint[2].c = 0; /* Up    */
+        etaPoint[3].i = ex;
+        etaPoint[3].j = ey - 1;
+        etaPoint[3].loc = DMSTAG_ELEMENT;
+        etaPoint[3].c = 0; /* Down  */
+        PetscCall(DMStagVecGetValuesStencil(dm_coefficients, coefficients_local,
+                                            4, etaPoint, eta));
+        eta_left = eta[0];
+        eta_right = eta[1];
+        eta_up = eta[2];
+        eta_down = eta[3];
+
+        count = 0;
+
+        col[count] = row;
+        val_A[count] = -2.0 * dv * (eta_down + eta_up) / (hy * hy);
+        if (!left_boundary)
+          val_A[count] += -1.0 * dv * eta_left / (hx * hx);
+        if (!right_boundary)
+          val_A[count] += -1.0 * dv * eta_right / (hx * hx);
+        ++count;
+
+        col[count].i = ex;
+        col[count].j = ey - 1;
+        col[count].loc = DMSTAG_DOWN;
+        col[count].c = 0;
+        val_A[count] = 2.0 * dv * eta_down / (hy * hy);
+        ++count;
+        col[count].i = ex;
+        col[count].j = ey + 1;
+        col[count].loc = DMSTAG_DOWN;
+        col[count].c = 0;
+        val_A[count] = 2.0 * dv * eta_up / (hy * hy);
+        ++count;
+        if (!left_boundary) {
+          col[count].i = ex - 1;
+          col[count].j = ey;
+          col[count].loc = DMSTAG_DOWN;
+          col[count].c = 0;
+          val_A[count] = dv * eta_left / (hx * hx);
+          ++count;
+        }
+        if (!right_boundary) {
+          col[count].i = ex + 1;
+          col[count].j = ey;
+          col[count].loc = DMSTAG_DOWN;
+          col[count].c = 0;
+          val_A[count] = dv * eta_right / (hx * hx);
+          ++count;
+        }
+        col[count].i = ex;
+        col[count].j = ey - 1;
+        col[count].loc = DMSTAG_LEFT;
+        col[count].c = 0;
+        val_A[count] = dv * eta_left / (hx * hy);
+        ++count; /* down left x edge */
+        col[count].i = ex;
+        col[count].j = ey - 1;
+        col[count].loc = DMSTAG_RIGHT;
+        col[count].c = 0;
+        val_A[count] = -1.0 * dv * eta_right / (hx * hy);
+        ++count; /* down right x edge */
+        col[count].i = ex;
+        col[count].j = ey;
+        col[count].loc = DMSTAG_LEFT;
+        col[count].c = 0;
+        val_A[count] = -1.0 * dv * eta_left / (hx * hy);
+        ++count; /* up left x edge */
+        col[count].i = ex;
+        col[count].j = ey;
+        col[count].loc = DMSTAG_RIGHT;
+        col[count].c = 0;
+        val_A[count] = dv * eta_right / (hx * hy);
+        ++count; /* up right x edge */
+        if (!parameters->faces_only) {
+          col[count].i = ex;
+          col[count].j = ey - 1;
+          col[count].loc = DMSTAG_ELEMENT;
+          col[count].c = 0;
+          val_A[count] = K_cont * dv / hy;
+          ++count;
+          col[count].i = ex;
+          col[count].j = ey;
+          col[count].loc = DMSTAG_ELEMENT;
+          col[count].c = 0;
+          val_A[count] = -1.0 * K_cont * dv / hy;
+          ++count;
+        }
+
+        PetscCall(DMStagMatSetValuesStencil(dm_main, A, 1, &row, count, col,
+                                            val_A, INSERT_VALUES));
+        if (build_rhs)
+          PetscCall(DMStagVecSetValuesStencil(dm_main, rhs, 1, &row, &val_rhs,
+                                              INSERT_VALUES));
+      }
+
+      if (ex == N[0] - 1) {
+        /* Right Boundary velocity Dirichlet */
+        /* Redundant in the corner */
+        DMStagStencil row;
+        const PetscScalar val_rhs = 0.0;
+        const PetscScalar val_A = K_bound;
+
+        row.i = ex;
+        row.j = ey;
+        row.loc = DMSTAG_RIGHT;
+        row.c = 0;
+        PetscCall(DMStagMatSetValuesStencil(dm_main, A, 1, &row, 1, &row,
+                                            &val_A, INSERT_VALUES));
+        if (build_rhs)
+          PetscCall(DMStagVecSetValuesStencil(dm_main, rhs, 1, &row, &val_rhs,
+                                              INSERT_VALUES));
+      }
+      if (ex == 0) {
+        /* Left velocity Dirichlet */
+        DMStagStencil row;
+        const PetscScalar val_rhs = 0.0;
+        const PetscScalar val_A = K_bound;
+
+        row.i = ex;
+        row.j = ey;
+        row.loc = DMSTAG_LEFT;
+        row.c = 0;
+        PetscCall(DMStagMatSetValuesStencil(dm_main, A, 1, &row, 1, &row,
+                                            &val_A, INSERT_VALUES));
+        if (build_rhs)
+          PetscCall(DMStagVecSetValuesStencil(dm_main, rhs, 1, &row, &val_rhs,
+                                              INSERT_VALUES));
+      } else {
+        /* X-momentum equation : (u_xx + u_yy) - p_x = f^x
+          zero RHS, including free-slip boundary conditions */
+        PetscInt count;
+        DMStagStencil row, col[11];
+        PetscScalar val_A[11];
+        DMStagStencil etaPoint[4];
+        PetscScalar eta[4], eta_left, eta_right, eta_up, eta_down;
+        const PetscScalar val_rhs = 0.0;
+
+        row.i = ex;
+        row.j = ey;
+        row.loc = DMSTAG_LEFT;
+        row.c = 0;
+
+        /* Get eta values */
+        etaPoint[0].i = ex - 1;
+        etaPoint[0].j = ey;
+        etaPoint[0].loc = DMSTAG_ELEMENT;
+        etaPoint[0].c = 0; /* Left  */
+        etaPoint[1].i = ex;
+        etaPoint[1].j = ey;
+        etaPoint[1].loc = DMSTAG_ELEMENT;
+        etaPoint[1].c = 0; /* Right */
+        etaPoint[2].i = ex;
+        etaPoint[2].j = ey;
+        etaPoint[2].loc = DMSTAG_UP_LEFT;
+        etaPoint[2].c = 0; /* Up    */
+        etaPoint[3].i = ex;
+        etaPoint[3].j = ey;
+        etaPoint[3].loc = DMSTAG_DOWN_LEFT;
+        etaPoint[3].c = 0; /* Down  */
+        PetscCall(DMStagVecGetValuesStencil(dm_coefficients, coefficients_local,
+                                            4, etaPoint, eta));
+        eta_left = eta[0];
+        eta_right = eta[1];
+        eta_up = eta[2];
+        eta_down = eta[3];
+
+        count = 0;
+        col[count] = row;
+        val_A[count] = -2.0 * dv * (eta_left + eta_right) / (hx * hx);
+        if (!bottom_boundary)
+          val_A[count] += -1.0 * dv * eta_down / (hy * hy);
+        if (!top_boundary)
+          val_A[count] += -1.0 * dv * eta_up / (hy * hy);
+        ++count;
+
+        if (!bottom_boundary) {
+          col[count].i = ex;
+          col[count].j = ey - 1;
+          col[count].loc = DMSTAG_LEFT;
+          col[count].c = 0;
+          val_A[count] = dv * eta_down / (hy * hy);
+          ++count;
+        }
+        if (!top_boundary) {
+          col[count].i = ex;
+          col[count].j = ey + 1;
+          col[count].loc = DMSTAG_LEFT;
+          col[count].c = 0;
+          val_A[count] = dv * eta_up / (hy * hy);
+          ++count;
+        }
+        col[count].i = ex - 1;
+        col[count].j = ey;
+        col[count].loc = DMSTAG_LEFT;
+        col[count].c = 0;
+        val_A[count] = 2.0 * dv * eta_left / (hx * hx);
+        ++count;
+        col[count].i = ex + 1;
+        col[count].j = ey;
+        col[count].loc = DMSTAG_LEFT;
+        col[count].c = 0;
+        val_A[count] = 2.0 * dv * eta_right / (hx * hx);
+        ++count;
+        col[count].i = ex - 1;
+        col[count].j = ey;
+        col[count].loc = DMSTAG_DOWN;
+        col[count].c = 0;
+        val_A[count] = dv * eta_down / (hx * hy);
+        ++count; /* down left */
+        col[count].i = ex;
+        col[count].j = ey;
+        col[count].loc = DMSTAG_DOWN;
+        col[count].c = 0;
+        val_A[count] = -1.0 * dv * eta_down / (hx * hy);
+        ++count; /* down right */
+        col[count].i = ex - 1;
+        col[count].j = ey;
+        col[count].loc = DMSTAG_UP;
+        col[count].c = 0;
+        val_A[count] = -1.0 * dv * eta_up / (hx * hy);
+        ++count; /* up left */
+        col[count].i = ex;
+        col[count].j = ey;
+        col[count].loc = DMSTAG_UP;
+        col[count].c = 0;
+        val_A[count] = dv * eta_up / (hx * hy);
+        ++count; /* up right */
+        if (!parameters->faces_only) {
+          col[count].i = ex - 1;
+          col[count].j = ey;
+          col[count].loc = DMSTAG_ELEMENT;
+          col[count].c = 0;
+          val_A[count] = K_cont * dv / hx;
+          ++count;
+          col[count].i = ex;
+          col[count].j = ey;
+          col[count].loc = DMSTAG_ELEMENT;
+          col[count].c = 0;
+          val_A[count] = -1.0 * K_cont * dv / hx;
+          ++count;
+        }
+
+        PetscCall(DMStagMatSetValuesStencil(dm_main, A, 1, &row, count, col,
+                                            val_A, INSERT_VALUES));
+        if (build_rhs)
+          PetscCall(DMStagVecSetValuesStencil(dm_main, rhs, 1, &row, &val_rhs,
+                                              INSERT_VALUES));
+      }
+
+      /* P equation : u_x + v_y = 0
+
+         Note that this includes an explicit zero on the diagonal. This is only
+        needed for direct solvers (not required if using an iterative solver and
+        setting the constant-pressure nullspace)
+
+        Note: the scaling by dv is not chosen in a principled way and is likely
+        sub-optimal
+       */
+      if (!parameters->faces_only) {
+        if (ctx->pin_pressure && ex == 0 &&
+            ey == 0) { /* Pin the first pressure node to zero, if requested */
+          DMStagStencil row;
+          const PetscScalar val_A = K_bound;
+          const PetscScalar val_rhs = 0.0;
+
+          row.i = ex;
+          row.j = ey;
+          row.loc = DMSTAG_ELEMENT;
+          row.c = 0;
+          PetscCall(DMStagMatSetValuesStencil(dm_main, A, 1, &row, 1, &row,
+                                              &val_A, INSERT_VALUES));
+          if (build_rhs)
+            PetscCall(DMStagVecSetValuesStencil(dm_main, rhs, 1, &row, &val_rhs,
+                                                INSERT_VALUES));
+        } else {
+          DMStagStencil row, col[5];
+          PetscScalar val_A[5];
+          const PetscScalar val_rhs = 0.0;
+
+          row.i = ex;
+          row.j = ey;
+          row.loc = DMSTAG_ELEMENT;
+          row.c = 0;
+          col[0].i = ex;
+          col[0].j = ey;
+          col[0].loc = DMSTAG_LEFT;
+          col[0].c = 0;
+          val_A[0] = -1.0 * K_cont * dv / hx;
+          col[1].i = ex;
+          col[1].j = ey;
+          col[1].loc = DMSTAG_RIGHT;
+          col[1].c = 0;
+          val_A[1] = K_cont * dv / hx;
+          col[2].i = ex;
+          col[2].j = ey;
+          col[2].loc = DMSTAG_DOWN;
+          col[2].c = 0;
+          val_A[2] = -1.0 * K_cont * dv / hy;
+          col[3].i = ex;
+          col[3].j = ey;
+          col[3].loc = DMSTAG_UP;
+          col[3].c = 0;
+          val_A[3] = K_cont * dv / hy;
+          col[4] = row;
+          val_A[4] = 0.0;
+          PetscCall(DMStagMatSetValuesStencil(dm_main, A, 1, &row, 5, col,
+                                              val_A, INSERT_VALUES));
+          if (build_rhs)
+            PetscCall(DMStagVecSetValuesStencil(dm_main, rhs, 1, &row, &val_rhs,
+                                                INSERT_VALUES));
+        }
+      }
+    }
+  }
+  PetscCall(DMRestoreLocalVector(dm_coefficients, &coefficients_local));
+
+  /* Add additional inverse viscosity terms (for use in building a
+   * preconditioning matrix) */
+  if (parameters->include_inverse_visc) {
+    PetscCheck(!parameters->faces_only, PetscObjectComm((PetscObject)dm_main),
+               PETSC_ERR_SUP, "Does not make sense with faces only");
+    PetscCall(OperatorInsertInverseViscosityPressureTerms(
+        dm_main, dm_coefficients, ctx->levels[level]->coeff, 1.0, A));
+  }
+
+  PetscCall(MatAssemblyBegin(A, MAT_FINAL_ASSEMBLY));
+  if (build_rhs)
+    PetscCall(VecAssemblyBegin(rhs));
+  PetscCall(MatAssemblyEnd(A, MAT_FINAL_ASSEMBLY));
+  if (build_rhs)
+    PetscCall(VecAssemblyEnd(rhs));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode CreateSystem3d(SystemParameters parameters, Mat *pA,
+                                     Vec *pRhs) {
+  PetscInt N[3];
+  PetscInt ex, ey, ez, startx, starty, startz, nx, ny, nz;
+  Mat A;
+  PetscReal hx, hy, hz, dv;
+  PetscInt pinx, piny, pinz;
+  Vec coeff_local, rhs;
+  PetscBool build_rhs;
+  DM dm_main, dm_coefficients;
+  PetscScalar K_cont, K_bound;
+  Ctx ctx = parameters->ctx;
+  PetscInt level = parameters->level;
+
+  PetscFunctionBeginUser;
+  if (parameters->faces_only) {
+    dm_main = ctx->levels[level]->dm_faces;
+  } else {
+    dm_main = ctx->levels[level]->dm_stokes;
+  }
+  dm_coefficients = ctx->levels[level]->dm_coefficients;
+  K_cont = ctx->levels[level]->K_cont;
+  K_bound = ctx->levels[level]->K_bound;
+  PetscCall(DMCreateMatrix(dm_main, pA));
+  A = *pA;
+  build_rhs = (PetscBool)(pRhs != NULL);
+  if (build_rhs) {
+    PetscCall(DMCreateGlobalVector(dm_main, pRhs));
+    rhs = *pRhs;
+  } else {
+    rhs = NULL;
+  }
+  PetscCall(DMStagGetCorners(dm_main, &startx, &starty, &startz, &nx, &ny, &nz,
+                             NULL, NULL, NULL));
+  PetscCall(DMStagGetGlobalSizes(dm_main, &N[0], &N[1], &N[2]));
+  hx = ctx->levels[level]->hx_characteristic;
+  hy = ctx->levels[level]->hy_characteristic;
+  hz = ctx->levels[level]->hz_characteristic;
+  dv = hx * hy * hz;
+  PetscCall(DMGetLocalVector(dm_coefficients, &coeff_local));
+  PetscCall(DMGlobalToLocal(dm_coefficients, ctx->levels[level]->coeff,
+                            INSERT_VALUES, coeff_local));
+
+  PetscCheck(N[0] >= 2 && N[1] >= 2 && N[2] >= 2, PETSC_COMM_WORLD,
+             PETSC_ERR_SUP,
+             "Not implemented for less than 2 elements in any direction");
+  pinx = 1;
+  piny = 0;
+  pinz = 0; /* Depends on assertion above that there are at least two element in
+               the x direction */
+
+  /* Loop over all local elements.
+
+     For each element, fill 4-7 rows of the matrix, corresponding to
+     - the pressure degree of freedom (dof), centered on the element
+     - the 3 velocity dofs on left, bottom, and back faces of the element
+     - velocity dof on the right, top, and front faces of the element (only on
+     domain boundaries)
+
+   */
+  for (ez = startz; ez < startz + nz; ++ez) {
+    for (ey = starty; ey < starty + ny; ++ey) {
+      for (ex = startx; ex < startx + nx; ++ex) {
+        const PetscBool left_boundary = (PetscBool)(ex == 0);
+        const PetscBool right_boundary = (PetscBool)(ex == N[0] - 1);
+        const PetscBool bottom_boundary = (PetscBool)(ey == 0);
+        const PetscBool top_boundary = (PetscBool)(ey == N[1] - 1);
+        const PetscBool back_boundary = (PetscBool)(ez == 0);
+        const PetscBool front_boundary = (PetscBool)(ez == N[2] - 1);
+
+        /* Note that below, we depend on the check above that there is never one
+           element (globally) in a given direction.  Thus, for example, an
+           element is never both on the left and right boundary */
+
+        /* X-faces - right boundary */
+        if (right_boundary) {
+          /* Right x-velocity Dirichlet */
+          DMStagStencil row;
+          const PetscScalar val_rhs = 0.0;
+          const PetscScalar val_A = K_bound;
+
+          row.i = ex;
+          row.j = ey;
+          row.k = ez;
+          row.loc = DMSTAG_RIGHT;
+          row.c = 0;
+          PetscCall(DMStagMatSetValuesStencil(dm_main, A, 1, &row, 1, &row,
+                                              &val_A, INSERT_VALUES));
+          if (build_rhs)
+            PetscCall(DMStagVecSetValuesStencil(dm_main, rhs, 1, &row, &val_rhs,
+                                                INSERT_VALUES));
+        }
+
+        /* X faces - left*/
+        {
+          DMStagStencil row;
+
+          row.i = ex;
+          row.j = ey;
+          row.k = ez;
+          row.loc = DMSTAG_LEFT;
+          row.c = 0;
+
+          if (left_boundary) {
+            /* Left x-velocity Dirichlet */
+            const PetscScalar val_rhs = 0.0;
+            const PetscScalar val_A = K_bound;
+
+            PetscCall(DMStagMatSetValuesStencil(dm_main, A, 1, &row, 1, &row,
+                                                &val_A, INSERT_VALUES));
+            if (build_rhs)
+              PetscCall(DMStagVecSetValuesStencil(dm_main, rhs, 1, &row,
+                                                  &val_rhs, INSERT_VALUES));
+          } else {
+            /* X-momentum equation */
+            PetscInt count;
+            DMStagStencil col[17];
+            PetscScalar val_A[17];
+            DMStagStencil eta_point[6];
+            PetscScalar eta[6], eta_left, eta_right, eta_up, eta_down, eta_back,
+                eta_front; /* relative to the left face */
+            const PetscScalar val_rhs = 0.0;
+
+            /* Get eta values */
+            eta_point[0].i = ex - 1;
+            eta_point[0].j = ey;
+            eta_point[0].k = ez;
+            eta_point[0].loc = DMSTAG_ELEMENT;
+            eta_point[0].c = 0; /* Left  */
+            eta_point[1].i = ex;
+            eta_point[1].j = ey;
+            eta_point[1].k = ez;
+            eta_point[1].loc = DMSTAG_ELEMENT;
+            eta_point[1].c = 0; /* Right */
+            eta_point[2].i = ex;
+            eta_point[2].j = ey;
+            eta_point[2].k = ez;
+            eta_point[2].loc = DMSTAG_DOWN_LEFT;
+            eta_point[2].c = 0; /* Down  */
+            eta_point[3].i = ex;
+            eta_point[3].j = ey;
+            eta_point[3].k = ez;
+            eta_point[3].loc = DMSTAG_UP_LEFT;
+            eta_point[3].c = 0; /* Up    */
+            eta_point[4].i = ex;
+            eta_point[4].j = ey;
+            eta_point[4].k = ez;
+            eta_point[4].loc = DMSTAG_BACK_LEFT;
+            eta_point[4].c = 0; /* Back  */
+            eta_point[5].i = ex;
+            eta_point[5].j = ey;
+            eta_point[5].k = ez;
+            eta_point[5].loc = DMSTAG_FRONT_LEFT;
+            eta_point[5].c = 0; /* Front  */
+            PetscCall(DMStagVecGetValuesStencil(dm_coefficients, coeff_local, 6,
+                                                eta_point, eta));
+            eta_left = eta[0];
+            eta_right = eta[1];
+            eta_down = eta[2];
+            eta_up = eta[3];
+            eta_back = eta[4];
+            eta_front = eta[5];
+
+            count = 0;
+
+            col[count] = row;
+            val_A[count] = -2.0 * dv * (eta_left + eta_right) / (hx * hx);
+            if (!top_boundary)
+              val_A[count] += -1.0 * dv * eta_up / (hy * hy);
+            if (!bottom_boundary)
+              val_A[count] += -1.0 * dv * eta_down / (hy * hy);
+            if (!back_boundary)
+              val_A[count] += -1.0 * dv * eta_back / (hz * hz);
+            if (!front_boundary)
+              val_A[count] += -1.0 * dv * eta_front / (hz * hz);
+            ++count;
+
+            col[count].i = ex - 1;
+            col[count].j = ey;
+            col[count].k = ez;
+            col[count].loc = DMSTAG_LEFT;
+            col[count].c = 0;
+            val_A[count] = 2.0 * dv * eta_left / (hx * hx);
+            ++count;
+            col[count].i = ex + 1;
+            col[count].j = ey;
+            col[count].k = ez;
+            col[count].loc = DMSTAG_LEFT;
+            col[count].c = 0;
+            val_A[count] = 2.0 * dv * eta_right / (hx * hx);
+            ++count;
+            if (!bottom_boundary) {
+              col[count].i = ex;
+              col[count].j = ey - 1;
+              col[count].k = ez;
+              col[count].loc = DMSTAG_LEFT;
+              col[count].c = 0;
+              val_A[count] = dv * eta_down / (hy * hy);
+              ++count;
+            }
+            if (!top_boundary) {
+              col[count].i = ex;
+              col[count].j = ey + 1;
+              col[count].k = ez;
+              col[count].loc = DMSTAG_LEFT;
+              col[count].c = 0;
+              val_A[count] = dv * eta_up / (hy * hy);
+              ++count;
+            }
+            if (!back_boundary) {
+              col[count].i = ex;
+              col[count].j = ey;
+              col[count].k = ez - 1;
+              col[count].loc = DMSTAG_LEFT;
+              col[count].c = 0;
+              val_A[count] = dv * eta_back / (hz * hz);
+              ++count;
+            }
+            if (!front_boundary) {
+              col[count].i = ex;
+              col[count].j = ey;
+              col[count].k = ez + 1;
+              col[count].loc = DMSTAG_LEFT;
+              col[count].c = 0;
+              val_A[count] = dv * eta_front / (hz * hz);
+              ++count;
+            }
+
+            col[count].i = ex - 1;
+            col[count].j = ey;
+            col[count].k = ez;
+            col[count].loc = DMSTAG_DOWN;
+            col[count].c = 0;
+            val_A[count] = dv * eta_down / (hx * hy);
+            ++count; /* down left */
+            col[count].i = ex;
+            col[count].j = ey;
+            col[count].k = ez;
+            col[count].loc = DMSTAG_DOWN;
+            col[count].c = 0;
+            val_A[count] = -1.0 * dv * eta_down / (hx * hy);
+            ++count; /* down right */
+
+            col[count].i = ex - 1;
+            col[count].j = ey;
+            col[count].k = ez;
+            col[count].loc = DMSTAG_UP;
+            col[count].c = 0;
+            val_A[count] = -1.0 * dv * eta_up / (hx * hy);
+            ++count; /* up left */
+            col[count].i = ex;
+            col[count].j = ey;
+            col[count].k = ez;
+            col[count].loc = DMSTAG_UP;
+            col[count].c = 0;
+            val_A[count] = dv * eta_up / (hx * hy);
+            ++count; /* up right */
+
+            col[count].i = ex - 1;
+            col[count].j = ey;
+            col[count].k = ez;
+            col[count].loc = DMSTAG_BACK;
+            col[count].c = 0;
+            val_A[count] = dv * eta_back / (hx * hz);
+            ++count; /* back left */
+            col[count].i = ex;
+            col[count].j = ey;
+            col[count].k = ez;
+            col[count].loc = DMSTAG_BACK;
+            col[count].c = 0;
+            val_A[count] = -1.0 * dv * eta_back / (hx * hz);
+            ++count; /* back right */
+
+            col[count].i = ex - 1;
+            col[count].j = ey;
+            col[count].k = ez;
+            col[count].loc = DMSTAG_FRONT;
+            col[count].c = 0;
+            val_A[count] = -1.0 * dv * eta_front / (hx * hz);
+            ++count; /* front left */
+            col[count].i = ex;
+            col[count].j = ey;
+            col[count].k = ez;
+            col[count].loc = DMSTAG_FRONT;
+            col[count].c = 0;
+            val_A[count] = dv * eta_front / (hx * hz);
+            ++count; /* front right */
+
+            if (!parameters->faces_only) {
+              col[count].i = ex - 1;
+              col[count].j = ey;
+              col[count].k = ez;
+              col[count].loc = DMSTAG_ELEMENT;
+              col[count].c = 0;
+              val_A[count] = K_cont * dv / hx;
+              ++count;
+              col[count].i = ex;
+              col[count].j = ey;
+              col[count].k = ez;
+              col[count].loc = DMSTAG_ELEMENT;
+              col[count].c = 0;
+              val_A[count] = -1.0 * K_cont * dv / hx;
+              ++count;
+            }
+
+            PetscCall(DMStagMatSetValuesStencil(dm_main, A, 1, &row, count, col,
+                                                val_A, INSERT_VALUES));
+            if (build_rhs)
+              PetscCall(DMStagVecSetValuesStencil(dm_main, rhs, 1, &row,
+                                                  &val_rhs, INSERT_VALUES));
+          }
+        }
+
+        /* Y faces - top boundary */
+        if (top_boundary) {
+          /* Top y-velocity Dirichlet */
+          DMStagStencil row;
+          const PetscScalar val_rhs = 0.0;
+          const PetscScalar val_A = K_bound;
+
+          row.i = ex;
+          row.j = ey;
+          row.k = ez;
+          row.loc = DMSTAG_UP;
+          row.c = 0;
+          PetscCall(DMStagMatSetValuesStencil(dm_main, A, 1, &row, 1, &row,
+                                              &val_A, INSERT_VALUES));
+          if (build_rhs)
+            PetscCall(DMStagVecSetValuesStencil(dm_main, rhs, 1, &row, &val_rhs,
+                                                INSERT_VALUES));
+        }
+
+        /* Y faces - down */
+        {
+          DMStagStencil row;
+
+          row.i = ex;
+          row.j = ey;
+          row.k = ez;
+          row.loc = DMSTAG_DOWN;
+          row.c = 0;
+
+          if (bottom_boundary) {
+            /* Bottom y-velocity Dirichlet */
+            const PetscScalar val_rhs = 0.0;
+            const PetscScalar val_A = K_bound;
+
+            PetscCall(DMStagMatSetValuesStencil(dm_main, A, 1, &row, 1, &row,
+                                                &val_A, INSERT_VALUES));
+            if (build_rhs)
+              PetscCall(DMStagVecSetValuesStencil(dm_main, rhs, 1, &row,
+                                                  &val_rhs, INSERT_VALUES));
+          } else {
+            /* Y-momentum equation (including non-zero forcing) */
+            PetscInt count;
+            DMStagStencil col[17];
+            PetscScalar val_rhs, val_A[17];
+            DMStagStencil eta_point[6], rho_point[4];
+            PetscScalar eta[6], rho[4], eta_left, eta_right, eta_up, eta_down,
+                eta_back, eta_front; /* relative to the bottom face */
+
+            if (build_rhs) {
+              /* get rho values  (note .c = 1) */
+              /* Note that we have rho at perhaps strange points (edges not
+               * corners) */
+              rho_point[0].i = ex;
+              rho_point[0].j = ey;
+              rho_point[0].k = ez;
+              rho_point[0].loc = DMSTAG_DOWN_LEFT;
+              rho_point[0].c = 1;
+              rho_point[1].i = ex;
+              rho_point[1].j = ey;
+              rho_point[1].k = ez;
+              rho_point[1].loc = DMSTAG_DOWN_RIGHT;
+              rho_point[1].c = 1;
+              rho_point[2].i = ex;
+              rho_point[2].j = ey;
+              rho_point[2].k = ez;
+              rho_point[2].loc = DMSTAG_BACK_DOWN;
+              rho_point[2].c = 1;
+              rho_point[3].i = ex;
+              rho_point[3].j = ey;
+              rho_point[3].k = ez;
+              rho_point[3].loc = DMSTAG_FRONT_DOWN;
+              rho_point[3].c = 1;
+              PetscCall(DMStagVecGetValuesStencil(dm_coefficients, coeff_local,
+                                                  4, rho_point, rho));
+
+              /* Compute forcing */
+              val_rhs =
+                  ctx->gy * dv * (0.25 * (rho[0] + rho[1] + rho[2] + rho[3]));
+            }
+
+            /* Get eta values */
+            eta_point[0].i = ex;
+            eta_point[0].j = ey;
+            eta_point[0].k = ez;
+            eta_point[0].loc = DMSTAG_DOWN_LEFT;
+            eta_point[0].c = 0; /* Left  */
+            eta_point[1].i = ex;
+            eta_point[1].j = ey;
+            eta_point[1].k = ez;
+            eta_point[1].loc = DMSTAG_DOWN_RIGHT;
+            eta_point[1].c = 0; /* Right */
+            eta_point[2].i = ex;
+            eta_point[2].j = ey - 1;
+            eta_point[2].k = ez;
+            eta_point[2].loc = DMSTAG_ELEMENT;
+            eta_point[2].c = 0; /* Down  */
+            eta_point[3].i = ex;
+            eta_point[3].j = ey;
+            eta_point[3].k = ez;
+            eta_point[3].loc = DMSTAG_ELEMENT;
+            eta_point[3].c = 0; /* Up    */
+            eta_point[4].i = ex;
+            eta_point[4].j = ey;
+            eta_point[4].k = ez;
+            eta_point[4].loc = DMSTAG_BACK_DOWN;
+            eta_point[4].c = 0; /* Back  */
+            eta_point[5].i = ex;
+            eta_point[5].j = ey;
+            eta_point[5].k = ez;
+            eta_point[5].loc = DMSTAG_FRONT_DOWN;
+            eta_point[5].c = 0; /* Front  */
+            PetscCall(DMStagVecGetValuesStencil(dm_coefficients, coeff_local, 6,
+                                                eta_point, eta));
+            eta_left = eta[0];
+            eta_right = eta[1];
+            eta_down = eta[2];
+            eta_up = eta[3];
+            eta_back = eta[4];
+            eta_front = eta[5];
+
+            count = 0;
+
+            col[count] = row;
+            val_A[count] = -2.0 * dv * (eta_up + eta_down) / (hy * hy);
+            if (!left_boundary)
+              val_A[count] += -1.0 * dv * eta_left / (hx * hx);
+            if (!right_boundary)
+              val_A[count] += -1.0 * dv * eta_right / (hx * hx);
+            if (!back_boundary)
+              val_A[count] += -1.0 * dv * eta_back / (hz * hz);
+            if (!front_boundary)
+              val_A[count] += -1.0 * dv * eta_front / (hz * hz);
+            ++count;
+
+            col[count].i = ex;
+            col[count].j = ey - 1;
+            col[count].k = ez;
+            col[count].loc = DMSTAG_DOWN;
+            col[count].c = 0;
+            val_A[count] = 2.0 * dv * eta_down / (hy * hy);
+            ++count;
+            col[count].i = ex;
+            col[count].j = ey + 1;
+            col[count].k = ez;
+            col[count].loc = DMSTAG_DOWN;
+            col[count].c = 0;
+            val_A[count] = 2.0 * dv * eta_up / (hy * hy);
+            ++count;
+
+            if (!left_boundary) {
+              col[count].i = ex - 1;
+              col[count].j = ey;
+              col[count].k = ez;
+              col[count].loc = DMSTAG_DOWN;
+              col[count].c = 0;
+              val_A[count] = dv * eta_left / (hx * hx);
+              ++count;
+            }
+            if (!right_boundary) {
+              col[count].i = ex + 1;
+              col[count].j = ey;
+              col[count].k = ez;
+              col[count].loc = DMSTAG_DOWN;
+              col[count].c = 0;
+              val_A[count] = dv * eta_right / (hx * hx);
+              ++count;
+            }
+            if (!back_boundary) {
+              col[count].i = ex;
+              col[count].j = ey;
+              col[count].k = ez - 1;
+              col[count].loc = DMSTAG_DOWN;
+              col[count].c = 0;
+              val_A[count] = dv * eta_back / (hz * hz);
+              ++count;
+            }
+            if (!front_boundary) {
+              col[count].i = ex;
+              col[count].j = ey;
+              col[count].k = ez + 1;
+              col[count].loc = DMSTAG_DOWN;
+              col[count].c = 0;
+              val_A[count] = dv * eta_front / (hz * hz);
+              ++count;
+            }
+
+            col[count].i = ex;
+            col[count].j = ey - 1;
+            col[count].k = ez;
+            col[count].loc = DMSTAG_LEFT;
+            col[count].c = 0;
+            val_A[count] = dv * eta_left / (hx * hy);
+            ++count; /* down left*/
+            col[count].i = ex;
+            col[count].j = ey;
+            col[count].k = ez;
+            col[count].loc = DMSTAG_LEFT;
+            col[count].c = 0;
+            val_A[count] = -1.0 * dv * eta_left / (hx * hy);
+            ++count; /* up left*/
+
+            col[count].i = ex;
+            col[count].j = ey - 1;
+            col[count].k = ez;
+            col[count].loc = DMSTAG_RIGHT;
+            col[count].c = 0;
+            val_A[count] = -1.0 * dv * eta_right / (hx * hy);
+            ++count; /* down right*/
+            col[count].i = ex;
+            col[count].j = ey;
+            col[count].k = ez;
+            col[count].loc = DMSTAG_RIGHT;
+            col[count].c = 0;
+            val_A[count] = dv * eta_right / (hx * hy);
+            ++count; /* up right*/
+
+            col[count].i = ex;
+            col[count].j = ey - 1;
+            col[count].k = ez;
+            col[count].loc = DMSTAG_BACK;
+            col[count].c = 0;
+            val_A[count] = dv * eta_back / (hy * hz);
+            ++count; /* back down */
+            col[count].i = ex;
+            col[count].j = ey;
+            col[count].k = ez;
+            col[count].loc = DMSTAG_BACK;
+            col[count].c = 0;
+            val_A[count] = -1.0 * dv * eta_back / (hy * hz);
+            ++count; /* back up */
+
+            col[count].i = ex;
+            col[count].j = ey - 1;
+            col[count].k = ez;
+            col[count].loc = DMSTAG_FRONT;
+            col[count].c = 0;
+            val_A[count] = -1.0 * dv * eta_front / (hy * hz);
+            ++count; /* front down */
+            col[count].i = ex;
+            col[count].j = ey;
+            col[count].k = ez;
+            col[count].loc = DMSTAG_FRONT;
+            col[count].c = 0;
+            val_A[count] = dv * eta_front / (hy * hz);
+            ++count; /* front up */
+
+            if (!parameters->faces_only) {
+              col[count].i = ex;
+              col[count].j = ey - 1;
+              col[count].k = ez;
+              col[count].loc = DMSTAG_ELEMENT;
+              col[count].c = 0;
+              val_A[count] = K_cont * dv / hy;
+              ++count;
+              col[count].i = ex;
+              col[count].j = ey;
+              col[count].k = ez;
+              col[count].loc = DMSTAG_ELEMENT;
+              col[count].c = 0;
+              val_A[count] = -1.0 * K_cont * dv / hy;
+              ++count;
+            }
+
+            PetscCall(DMStagMatSetValuesStencil(dm_main, A, 1, &row, count, col,
+                                                val_A, INSERT_VALUES));
+            if (build_rhs)
+              PetscCall(DMStagVecSetValuesStencil(dm_main, rhs, 1, &row,
+                                                  &val_rhs, INSERT_VALUES));
+          }
+        }
+
+        if (front_boundary) {
+          /* Front z-velocity Dirichlet */
+          DMStagStencil row;
+          const PetscScalar val_rhs = 0.0;
+          const PetscScalar val_A = K_bound;
+
+          row.i = ex;
+          row.j = ey;
+          row.k = ez;
+          row.loc = DMSTAG_FRONT;
+          row.c = 0;
+          PetscCall(DMStagMatSetValuesStencil(dm_main, A, 1, &row, 1, &row,
+                                              &val_A, INSERT_VALUES));
+          if (build_rhs)
+            PetscCall(DMStagVecSetValuesStencil(dm_main, rhs, 1, &row, &val_rhs,
+                                                INSERT_VALUES));
+        }
+
+        /* Z faces - back */
+        {
+          DMStagStencil row;
+
+          row.i = ex;
+          row.j = ey;
+          row.k = ez;
+          row.loc = DMSTAG_BACK;
+          row.c = 0;
+
+          if (back_boundary) {
+            /* Back z-velocity Dirichlet */
+            const PetscScalar val_rhs = 0.0;
+            const PetscScalar val_A = K_bound;
+
+            PetscCall(DMStagMatSetValuesStencil(dm_main, A, 1, &row, 1, &row,
+                                                &val_A, INSERT_VALUES));
+            if (build_rhs)
+              PetscCall(DMStagVecSetValuesStencil(dm_main, rhs, 1, &row,
+                                                  &val_rhs, INSERT_VALUES));
+          } else {
+            /* Z-momentum equation */
+            PetscInt count;
+            DMStagStencil col[17];
+            PetscScalar val_A[17];
+            DMStagStencil eta_point[6];
+            PetscScalar eta[6], eta_left, eta_right, eta_up, eta_down, eta_back,
+                eta_front; /* relative to the back face */
+            const PetscScalar val_rhs = 0.0;
+
+            /* Get eta values */
+            eta_point[0].i = ex;
+            eta_point[0].j = ey;
+            eta_point[0].k = ez;
+            eta_point[0].loc = DMSTAG_BACK_LEFT;
+            eta_point[0].c = 0; /* Left  */
+            eta_point[1].i = ex;
+            eta_point[1].j = ey;
+            eta_point[1].k = ez;
+            eta_point[1].loc = DMSTAG_BACK_RIGHT;
+            eta_point[1].c = 0; /* Right */
+            eta_point[2].i = ex;
+            eta_point[2].j = ey;
+            eta_point[2].k = ez;
+            eta_point[2].loc = DMSTAG_BACK_DOWN;
+            eta_point[2].c = 0; /* Down  */
+            eta_point[3].i = ex;
+            eta_point[3].j = ey;
+            eta_point[3].k = ez;
+            eta_point[3].loc = DMSTAG_BACK_UP;
+            eta_point[3].c = 0; /* Up    */
+            eta_point[4].i = ex;
+            eta_point[4].j = ey;
+            eta_point[4].k = ez - 1;
+            eta_point[4].loc = DMSTAG_ELEMENT;
+            eta_point[4].c = 0; /* Back  */
+            eta_point[5].i = ex;
+            eta_point[5].j = ey;
+            eta_point[5].k = ez;
+            eta_point[5].loc = DMSTAG_ELEMENT;
+            eta_point[5].c = 0; /* Front  */
+            PetscCall(DMStagVecGetValuesStencil(dm_coefficients, coeff_local, 6,
+                                                eta_point, eta));
+            eta_left = eta[0];
+            eta_right = eta[1];
+            eta_down = eta[2];
+            eta_up = eta[3];
+            eta_back = eta[4];
+            eta_front = eta[5];
+
+            count = 0;
+
+            col[count] = row;
+            val_A[count] = -2.0 * dv * (eta_back + eta_front) / (hz * hz);
+            if (!left_boundary)
+              val_A[count] += -1.0 * dv * eta_left / (hx * hx);
+            if (!right_boundary)
+              val_A[count] += -1.0 * dv * eta_right / (hx * hx);
+            if (!top_boundary)
+              val_A[count] += -1.0 * dv * eta_up / (hy * hy);
+            if (!bottom_boundary)
+              val_A[count] += -1.0 * dv * eta_down / (hy * hy);
+            ++count;
+
+            col[count].i = ex;
+            col[count].j = ey;
+            col[count].k = ez - 1;
+            col[count].loc = DMSTAG_BACK;
+            col[count].c = 0;
+            val_A[count] = 2.0 * dv * eta_back / (hz * hz);
+            ++count;
+            col[count].i = ex;
+            col[count].j = ey;
+            col[count].k = ez + 1;
+            col[count].loc = DMSTAG_BACK;
+            col[count].c = 0;
+            val_A[count] = 2.0 * dv * eta_front / (hz * hz);
+            ++count;
+
+            if (!left_boundary) {
+              col[count].i = ex - 1;
+              col[count].j = ey;
+              col[count].k = ez;
+              col[count].loc = DMSTAG_BACK;
+              col[count].c = 0;
+              val_A[count] = dv * eta_left / (hx * hx);
+              ++count;
+            }
+            if (!right_boundary) {
+              col[count].i = ex + 1;
+              col[count].j = ey;
+              col[count].k = ez;
+              col[count].loc = DMSTAG_BACK;
+              col[count].c = 0;
+              val_A[count] = dv * eta_right / (hx * hx);
+              ++count;
+            }
+            if (!bottom_boundary) {
+              col[count].i = ex;
+              col[count].j = ey - 1;
+              col[count].k = ez;
+              col[count].loc = DMSTAG_BACK;
+              col[count].c = 0;
+              val_A[count] = dv * eta_down / (hy * hy);
+              ++count;
+            }
+            if (!top_boundary) {
+              col[count].i = ex;
+              col[count].j = ey + 1;
+              col[count].k = ez;
+              col[count].loc = DMSTAG_BACK;
+              col[count].c = 0;
+              val_A[count] = dv * eta_up / (hy * hy);
+              ++count;
+            }
+
+            col[count].i = ex;
+            col[count].j = ey;
+            col[count].k = ez - 1;
+            col[count].loc = DMSTAG_LEFT;
+            col[count].c = 0;
+            val_A[count] = dv * eta_left / (hx * hz);
+            ++count; /* back left*/
+            col[count].i = ex;
+            col[count].j = ey;
+            col[count].k = ez;
+            col[count].loc = DMSTAG_LEFT;
+            col[count].c = 0;
+            val_A[count] = -1.0 * dv * eta_left / (hx * hz);
+            ++count; /* front left*/
+
+            col[count].i = ex;
+            col[count].j = ey;
+            col[count].k = ez - 1;
+            col[count].loc = DMSTAG_RIGHT;
+            col[count].c = 0;
+            val_A[count] = -1.0 * dv * eta_right / (hx * hz);
+            ++count; /* back right */
+            col[count].i = ex;
+            col[count].j = ey;
+            col[count].k = ez;
+            col[count].loc = DMSTAG_RIGHT;
+            col[count].c = 0;
+            val_A[count] = dv * eta_right / (hx * hz);
+            ++count; /* front right*/
+
+            col[count].i = ex;
+            col[count].j = ey;
+            col[count].k = ez - 1;
+            col[count].loc = DMSTAG_DOWN;
+            col[count].c = 0;
+            val_A[count] = dv * eta_down / (hy * hz);
+            ++count; /* back down */
+            col[count].i = ex;
+            col[count].j = ey;
+            col[count].k = ez;
+            col[count].loc = DMSTAG_DOWN;
+            col[count].c = 0;
+            val_A[count] = -1.0 * dv * eta_down / (hy * hz);
+            ++count; /* back down */
+
+            col[count].i = ex;
+            col[count].j = ey;
+            col[count].k = ez - 1;
+            col[count].loc = DMSTAG_UP;
+            col[count].c = 0;
+            val_A[count] = -1.0 * dv * eta_up / (hy * hz);
+            ++count; /* back up */
+            col[count].i = ex;
+            col[count].j = ey;
+            col[count].k = ez;
+            col[count].loc = DMSTAG_UP;
+            col[count].c = 0;
+            val_A[count] = dv * eta_up / (hy * hz);
+            ++count; /* back up */
+
+            if (!parameters->faces_only) {
+              col[count].i = ex;
+              col[count].j = ey;
+              col[count].k = ez - 1;
+              col[count].loc = DMSTAG_ELEMENT;
+              col[count].c = 0;
+              val_A[count] = K_cont * dv / hz;
+              ++count;
+              col[count].i = ex;
+              col[count].j = ey;
+              col[count].k = ez;
+              col[count].loc = DMSTAG_ELEMENT;
+              col[count].c = 0;
+              val_A[count] = -1.0 * K_cont * dv / hz;
+              ++count;
+            }
+
+            PetscCall(DMStagMatSetValuesStencil(dm_main, A, 1, &row, count, col,
+                                                val_A, INSERT_VALUES));
+            if (build_rhs)
+              PetscCall(DMStagVecSetValuesStencil(dm_main, rhs, 1, &row,
+                                                  &val_rhs, INSERT_VALUES));
+          }
+        }
+
+        /* Elements */
+        if (!parameters->faces_only) {
+          DMStagStencil row;
+
+          row.i = ex;
+          row.j = ey;
+          row.k = ez;
+          row.loc = DMSTAG_ELEMENT;
+          row.c = 0;
+
+          if (ctx->pin_pressure && ex == pinx && ey == piny && ez == pinz) {
+            /* Pin a pressure node to zero, if requested */
+            const PetscScalar val_A = K_bound;
+            const PetscScalar val_rhs = 0.0;
+
+            PetscCall(DMStagMatSetValuesStencil(dm_main, A, 1, &row, 1, &row,
+                                                &val_A, INSERT_VALUES));
+            if (build_rhs)
+              PetscCall(DMStagVecSetValuesStencil(dm_main, rhs, 1, &row,
+                                                  &val_rhs, INSERT_VALUES));
+          } else {
+            /* Continuity equation */
+            /* Note that this includes an explicit zero on the diagonal. This is
+               only needed for some direct solvers (not required if using an
+               iterative solver and setting a constant-pressure nullspace) */
+            /* Note: the scaling by dv is not chosen in a principled way and is
+             * likely sub-optimal */
+            DMStagStencil col[7];
+            PetscScalar val_A[7];
+            const PetscScalar val_rhs = 0.0;
+
+            col[0].i = ex;
+            col[0].j = ey;
+            col[0].k = ez;
+            col[0].loc = DMSTAG_LEFT;
+            col[0].c = 0;
+            val_A[0] = -1.0 * K_cont * dv / hx;
+            col[1].i = ex;
+            col[1].j = ey;
+            col[1].k = ez;
+            col[1].loc = DMSTAG_RIGHT;
+            col[1].c = 0;
+            val_A[1] = K_cont * dv / hx;
+            col[2].i = ex;
+            col[2].j = ey;
+            col[2].k = ez;
+            col[2].loc = DMSTAG_DOWN;
+            col[2].c = 0;
+            val_A[2] = -1.0 * K_cont * dv / hy;
+            col[3].i = ex;
+            col[3].j = ey;
+            col[3].k = ez;
+            col[3].loc = DMSTAG_UP;
+            col[3].c = 0;
+            val_A[3] = K_cont * dv / hy;
+            col[4].i = ex;
+            col[4].j = ey;
+            col[4].k = ez;
+            col[4].loc = DMSTAG_BACK;
+            col[4].c = 0;
+            val_A[4] = -1.0 * K_cont * dv / hz;
+            col[5].i = ex;
+            col[5].j = ey;
+            col[5].k = ez;
+            col[5].loc = DMSTAG_FRONT;
+            col[5].c = 0;
+            val_A[5] = K_cont * dv / hz;
+            col[6] = row;
+            val_A[6] = 0.0;
+            PetscCall(DMStagMatSetValuesStencil(dm_main, A, 1, &row, 7, col,
+                                                val_A, INSERT_VALUES));
+            if (build_rhs)
+              PetscCall(DMStagVecSetValuesStencil(dm_main, rhs, 1, &row,
+                                                  &val_rhs, INSERT_VALUES));
+          }
+        }
+      }
+    }
+  }
+  PetscCall(DMRestoreLocalVector(dm_coefficients, &coeff_local));
+
+  /* Add additional inverse viscosity terms (for use in building a
+   * preconditioning matrix) */
+  if (parameters->include_inverse_visc) {
+    PetscCheck(!parameters->faces_only, PetscObjectComm((PetscObject)dm_main),
+               PETSC_ERR_SUP, "Does not make sense with faces only");
+    PetscCall(OperatorInsertInverseViscosityPressureTerms(
+        dm_main, dm_coefficients, ctx->levels[level]->coeff, 1.0, A));
+  }
+
+  PetscCall(MatAssemblyBegin(A, MAT_FINAL_ASSEMBLY));
+  if (build_rhs)
+    PetscCall(VecAssemblyBegin(rhs));
+  PetscCall(MatAssemblyEnd(A, MAT_FINAL_ASSEMBLY));
+  if (build_rhs)
+    PetscCall(VecAssemblyEnd(rhs));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode CreateSystem(SystemParameters parameters, Mat *pA,
+                                   Vec *pRhs) {
+  PetscFunctionBeginUser;
+  if (parameters->ctx->dim == 2) {
+    PetscCall(CreateSystem2d(parameters, pA, pRhs));
+  } else if (parameters->ctx->dim == 3) {
+    PetscCall(CreateSystem3d(parameters, pA, pRhs));
+  } else
+    SETERRQ(PETSC_COMM_WORLD, PETSC_ERR_SUP,
+            "Unsupported dimension %" PetscInt_FMT, parameters->ctx->dim);
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+PetscErrorCode PopulateCoefficientData(Ctx ctx, PetscInt level) {
+  PetscInt dim;
+  PetscInt N[3];
+  PetscInt ex, ey, ez, startx, starty, startz, nx, ny, nz;
+  PetscInt slot_prev, slot_center;
+  PetscInt slot_rho_downleft, slot_rho_backleft, slot_rho_backdown,
+      slot_eta_element, slot_eta_downleft, slot_eta_backleft, slot_eta_backdown;
+  Vec coeff_local;
+  PetscReal **arr_coordinates_x, **arr_coordinates_y, **arr_coordinates_z;
+  DM dm_coefficients;
+  Vec coeff;
+
+  PetscFunctionBeginUser;
+  dm_coefficients = ctx->levels[level]->dm_coefficients;
+  PetscCall(DMGetDimension(dm_coefficients, &dim));
+
+  /* Create global coefficient vector */
+  PetscCall(DMCreateGlobalVector(dm_coefficients, &ctx->levels[level]->coeff));
+  coeff = ctx->levels[level]->coeff;
+
+  /* Get temporary access to a local representation of the coefficient data */
+  PetscCall(DMGetLocalVector(dm_coefficients, &coeff_local));
+  PetscCall(
+      DMGlobalToLocal(dm_coefficients, coeff, INSERT_VALUES, coeff_local));
+
+  /* Use direct array access to coefficient and coordinate arrays, to popoulate
+   * coefficient data */
+  PetscCall(DMStagGetGhostCorners(dm_coefficients, &startx, &starty, &startz,
+                                  &nx, &ny, &nz));
+  PetscCall(DMStagGetGlobalSizes(dm_coefficients, &N[0], &N[1], &N[2]));
+  PetscCall(DMStagGetProductCoordinateArraysRead(
+      dm_coefficients, &arr_coordinates_x, &arr_coordinates_y,
+      &arr_coordinates_z));
+  PetscCall(DMStagGetProductCoordinateLocationSlot(
+      dm_coefficients, DMSTAG_ELEMENT, &slot_center));
+  PetscCall(DMStagGetProductCoordinateLocationSlot(dm_coefficients, DMSTAG_LEFT,
+                                                   &slot_prev));
+  PetscCall(DMStagGetLocationSlot(dm_coefficients, DMSTAG_ELEMENT, 0,
+                                  &slot_eta_element));
+  PetscCall(DMStagGetLocationSlot(dm_coefficients, DMSTAG_DOWN_LEFT, 0,
+                                  &slot_eta_downleft));
+  PetscCall(DMStagGetLocationSlot(dm_coefficients, DMSTAG_DOWN_LEFT, 1,
+                                  &slot_rho_downleft));
+  if (dim == 2) {
+    PetscScalar ***arr_coefficients;
+
+    PetscCall(
+        DMStagVecGetArray(dm_coefficients, coeff_local, &arr_coefficients));
+    /* Note that these ranges are with respect to the local representation */
+    for (ey = starty; ey < starty + ny; ++ey) {
+      for (ex = startx; ex < startx + nx; ++ex) {
+        arr_coefficients[ey][ex][slot_eta_element] =
+            ctx->GetEta(ctx, arr_coordinates_x[ex][slot_center],
+                        arr_coordinates_y[ey][slot_center], 0.0);
+        arr_coefficients[ey][ex][slot_eta_downleft] =
+            ctx->GetEta(ctx, arr_coordinates_x[ex][slot_prev],
+                        arr_coordinates_y[ey][slot_prev], 0.0);
+        arr_coefficients[ey][ex][slot_rho_downleft] =
+            ctx->GetRho(ctx, arr_coordinates_x[ex][slot_prev],
+                        arr_coordinates_y[ey][slot_prev], 0.0);
+      }
+    }
+    PetscCall(
+        DMStagVecRestoreArray(dm_coefficients, coeff_local, &arr_coefficients));
+  } else if (dim == 3) {
+    PetscScalar ****arr_coefficients;
+
+    PetscCall(DMStagGetLocationSlot(dm_coefficients, DMSTAG_BACK_LEFT, 0,
+                                    &slot_eta_backleft));
+    PetscCall(DMStagGetLocationSlot(dm_coefficients, DMSTAG_BACK_LEFT, 1,
+                                    &slot_rho_backleft));
+    PetscCall(DMStagGetLocationSlot(dm_coefficients, DMSTAG_BACK_DOWN, 0,
+                                    &slot_eta_backdown));
+    PetscCall(DMStagGetLocationSlot(dm_coefficients, DMSTAG_BACK_DOWN, 1,
+                                    &slot_rho_backdown));
+    PetscCall(
+        DMStagVecGetArray(dm_coefficients, coeff_local, &arr_coefficients));
+    /* Note that these are with respect to the entire local representation,
+     * including ghosts */
+    for (ez = startz; ez < startz + nz; ++ez) {
+      for (ey = starty; ey < starty + ny; ++ey) {
+        for (ex = startx; ex < startx + nx; ++ex) {
+          const PetscScalar x_prev = arr_coordinates_x[ex][slot_prev];
+          const PetscScalar y_prev = arr_coordinates_y[ey][slot_prev];
+          const PetscScalar z_prev = arr_coordinates_z[ez][slot_prev];
+          const PetscScalar x_center = arr_coordinates_x[ex][slot_center];
+          const PetscScalar y_center = arr_coordinates_y[ey][slot_center];
+          const PetscScalar z_center = arr_coordinates_z[ez][slot_center];
+
+          arr_coefficients[ez][ey][ex][slot_eta_element] =
+              ctx->GetEta(ctx, x_center, y_center, z_center);
+          arr_coefficients[ez][ey][ex][slot_eta_downleft] =
+              ctx->GetEta(ctx, x_prev, y_prev, z_center);
+          arr_coefficients[ez][ey][ex][slot_rho_downleft] =
+              ctx->GetRho(ctx, x_prev, y_prev, z_center);
+          arr_coefficients[ez][ey][ex][slot_eta_backleft] =
+              ctx->GetEta(ctx, x_prev, y_center, z_prev);
+          arr_coefficients[ez][ey][ex][slot_rho_backleft] =
+              ctx->GetRho(ctx, x_prev, y_center, z_prev);
+          arr_coefficients[ez][ey][ex][slot_eta_backdown] =
+              ctx->GetEta(ctx, x_center, y_prev, z_prev);
+          arr_coefficients[ez][ey][ex][slot_rho_backdown] =
+              ctx->GetRho(ctx, x_center, y_prev, z_prev);
+        }
+      }
+    }
+    PetscCall(
+        DMStagVecRestoreArray(dm_coefficients, coeff_local, &arr_coefficients));
+  } else
+    SETERRQ(PetscObjectComm((PetscObject)dm_coefficients), PETSC_ERR_SUP,
+            "Unsupported dimension %" PetscInt_FMT, dim);
+  PetscCall(DMStagRestoreProductCoordinateArraysRead(
+      dm_coefficients, &arr_coordinates_x, &arr_coordinates_y,
+      &arr_coordinates_z));
+  PetscCall(
+      DMLocalToGlobal(dm_coefficients, coeff_local, INSERT_VALUES, coeff));
+  PetscCall(DMRestoreLocalVector(dm_coefficients, &coeff_local));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode CreateAuxiliaryOperator(Ctx ctx, PetscInt level,
+                                              Mat *p_S_hat) {
+  DM dm_element;
+  Mat S_hat;
+  DM dm_stokes, dm_coefficients;
+  Vec coeff;
+
+  PetscFunctionBeginUser;
+  dm_stokes = ctx->levels[level]->dm_stokes;
+  dm_coefficients = ctx->levels[level]->dm_coefficients;
+  coeff = ctx->levels[level]->coeff;
+  if (ctx->dim == 2) {
+    PetscCall(DMStagCreateCompatibleDMStag(dm_stokes, 0, 0, 1, 0, &dm_element));
+  } else if (ctx->dim == 3) {
+    PetscCall(DMStagCreateCompatibleDMStag(dm_stokes, 0, 0, 0, 1, &dm_element));
+  } else
+    SETERRQ(PETSC_COMM_WORLD, PETSC_ERR_SUP,
+            "Not implemented for dimension %" PetscInt_FMT, ctx->dim);
+  PetscCall(DMCreateMatrix(dm_element, p_S_hat));
+  S_hat = *p_S_hat;
+  PetscCall(OperatorInsertInverseViscosityPressureTerms(
+      dm_element, dm_coefficients, coeff, 1.0, S_hat));
+  PetscCall(MatAssemblyBegin(S_hat, MAT_FINAL_ASSEMBLY));
+  PetscCall(MatAssemblyEnd(S_hat, MAT_FINAL_ASSEMBLY));
+  PetscCall(DMDestroy(&dm_element));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode OperatorInsertInverseViscosityPressureTerms(
+    DM dm, DM dm_coefficients, Vec coefficients, PetscScalar scale, Mat mat) {
+  PetscInt dim, ex, ey, ez, startx, starty, startz, nx, ny, nz;
+  Vec coeff_local;
+
+  PetscFunctionBeginUser;
+  PetscCall(DMGetDimension(dm, &dim));
+  PetscCall(DMGetLocalVector(dm_coefficients, &coeff_local));
+  PetscCall(DMGlobalToLocal(dm_coefficients, coefficients, INSERT_VALUES,
+                            coeff_local));
+  PetscCall(DMStagGetCorners(dm, &startx, &starty, &startz, &nx, &ny, &nz, NULL,
+                             NULL, NULL));
+  if (dim == 2) { /* Trick to have one loop nest */
+    startz = 0;
+    nz = 1;
+  }
+  for (ez = startz; ez < startz + nz; ++ez) {
+    for (ey = starty; ey < starty + ny; ++ey) {
+      for (ex = startx; ex < startx + nx; ++ex) {
+        DMStagStencil from, to;
+        PetscScalar val;
+
+        /* component 0 on element is viscosity */
+        from.i = ex;
+        from.j = ey;
+        from.k = ez;
+        from.c = 0;
+        from.loc = DMSTAG_ELEMENT;
+        PetscCall(DMStagVecGetValuesStencil(dm_coefficients, coeff_local, 1,
+                                            &from, &val));
+        val = scale / val; /* inverse viscosity, scaled */
+        to = from;
+        PetscCall(DMStagMatSetValuesStencil(dm, mat, 1, &to, 1, &to, &val,
+                                            INSERT_VALUES));
+      }
+    }
+  }
+  PetscCall(DMRestoreLocalVector(dm_coefficients, &coeff_local));
+  /* Note that this function does not call MatAssembly{Begin,End} */
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+/* Create a pressure-only DMStag and use it to generate a nullspace vector
+   - Create a compatible DMStag with one dof per element (and nothing else).
+   - Create a constant vector and normalize it
+   - Migrate it to a vector on the original dmSol (making use of the fact
+   that this will fill in zeros for "extra" dof)
+   - Set the nullspace for the operator
+   - Destroy everything (the operator keeps the references it needs) */
+static PetscErrorCode AttachNullspace(DM dmSol, Mat A) {
+  DM dmPressure;
+  Vec constantPressure, basis;
+  PetscReal nrm;
+  MatNullSpace matNullSpace;
+
+  PetscFunctionBeginUser;
+  PetscCall(DMStagCreateCompatibleDMStag(dmSol, 0, 0, 1, 0, &dmPressure));
+  PetscCall(DMGetGlobalVector(dmPressure, &constantPressure));
+  PetscCall(VecSet(constantPressure, 1.0));
+  PetscCall(VecNorm(constantPressure, NORM_2, &nrm));
+  PetscCall(VecScale(constantPressure, 1.0 / nrm));
+  PetscCall(DMCreateGlobalVector(dmSol, &basis));
+  PetscCall(DMStagMigrateVec(dmPressure, constantPressure, dmSol, basis));
+  PetscCall(MatNullSpaceCreate(PetscObjectComm((PetscObject)dmSol), PETSC_FALSE,
+                               1, &basis, &matNullSpace));
+  PetscCall(VecDestroy(&basis));
+  PetscCall(MatSetNullSpace(A, matNullSpace));
+  PetscCall(MatNullSpaceDestroy(&matNullSpace));
+  PetscCall(DMRestoreGlobalVector(dmPressure, &constantPressure));
+  PetscCall(DMDestroy(&dmPressure));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode DumpSolution(Ctx ctx, PetscInt level, Vec x) {
+  DM dm_stokes, dm_coefficients;
+  Vec coeff;
+  DM dm_vel_avg;
+  Vec vel_avg;
+  DM da_vel_avg, da_p, da_eta_element;
+  Vec vec_vel_avg, vec_p, vec_eta_element;
+  DM da_eta_down_left, da_rho_down_left, da_eta_back_left, da_rho_back_left,
+      da_eta_back_down, da_rho_back_down;
+  Vec vec_eta_down_left, vec_rho_down_left, vec_eta_back_left,
+      vec_rho_back_left, vec_eta_back_down, vec_rho_back_down;
+  PetscInt ex, ey, ez, startx, starty, startz, nx, ny, nz;
+  Vec stokesLocal;
+
+  PetscFunctionBeginUser;
+  dm_stokes = ctx->levels[level]->dm_stokes;
+  dm_coefficients = ctx->levels[level]->dm_coefficients;
+  coeff = ctx->levels[level]->coeff;
+
+  /* For convenience, create a new DM and Vec which will hold averaged
+     velocities Note that this could also be accomplished with direct array
+     access, using DMStagVecGetArray() and related functions */
+  if (ctx->dim == 2) {
+    PetscCall(DMStagCreateCompatibleDMStag(
+        dm_stokes, 0, 0, 2, 0, &dm_vel_avg)); /* 2 dof per element */
+  } else if (ctx->dim == 3) {
+    PetscCall(DMStagCreateCompatibleDMStag(
+        dm_stokes, 0, 0, 0, 3, &dm_vel_avg)); /* 3 dof per element */
+  } else
+    SETERRQ(PETSC_COMM_WORLD, PETSC_ERR_SUP,
+            "Not Implemented for dimension %" PetscInt_FMT, ctx->dim);
+  PetscCall(DMSetUp(dm_vel_avg));
+  PetscCall(DMStagSetUniformCoordinatesProduct(dm_vel_avg, ctx->xmin, ctx->xmax,
+                                               ctx->ymin, ctx->ymax, ctx->zmin,
+                                               ctx->zmax));
+  PetscCall(DMCreateGlobalVector(dm_vel_avg, &vel_avg));
+  PetscCall(DMGetLocalVector(dm_stokes, &stokesLocal));
+  PetscCall(DMGlobalToLocal(dm_stokes, x, INSERT_VALUES, stokesLocal));
+  PetscCall(DMStagGetCorners(dm_vel_avg, &startx, &starty, &startz, &nx, &ny,
+                             &nz, NULL, NULL, NULL));
+  if (ctx->dim == 2) {
+    for (ey = starty; ey < starty + ny; ++ey) {
+      for (ex = startx; ex < startx + nx; ++ex) {
+        DMStagStencil from[4], to[2];
+        PetscScalar valFrom[4], valTo[2];
+
+        from[0].i = ex;
+        from[0].j = ey;
+        from[0].loc = DMSTAG_UP;
+        from[0].c = 0;
+        from[1].i = ex;
+        from[1].j = ey;
+        from[1].loc = DMSTAG_DOWN;
+        from[1].c = 0;
+        from[2].i = ex;
+        from[2].j = ey;
+        from[2].loc = DMSTAG_LEFT;
+        from[2].c = 0;
+        from[3].i = ex;
+        from[3].j = ey;
+        from[3].loc = DMSTAG_RIGHT;
+        from[3].c = 0;
+        PetscCall(DMStagVecGetValuesStencil(dm_stokes, stokesLocal, 4, from,
+                                            valFrom));
+        to[0].i = ex;
+        to[0].j = ey;
+        to[0].loc = DMSTAG_ELEMENT;
+        to[0].c = 0;
+        valTo[0] = 0.5 * (valFrom[2] + valFrom[3]);
+        to[1].i = ex;
+        to[1].j = ey;
+        to[1].loc = DMSTAG_ELEMENT;
+        to[1].c = 1;
+        valTo[1] = 0.5 * (valFrom[0] + valFrom[1]);
+        PetscCall(DMStagVecSetValuesStencil(dm_vel_avg, vel_avg, 2, to, valTo,
+                                            INSERT_VALUES));
+      }
+    }
+  } else if (ctx->dim == 3) {
+    for (ez = startz; ez < startz + nz; ++ez) {
+      for (ey = starty; ey < starty + ny; ++ey) {
+        for (ex = startx; ex < startx + nx; ++ex) {
+          DMStagStencil from[6], to[3];
+          PetscScalar valFrom[6], valTo[3];
+
+          from[0].i = ex;
+          from[0].j = ey;
+          from[0].k = ez;
+          from[0].loc = DMSTAG_UP;
+          from[0].c = 0;
+          from[1].i = ex;
+          from[1].j = ey;
+          from[1].k = ez;
+          from[1].loc = DMSTAG_DOWN;
+          from[1].c = 0;
+          from[2].i = ex;
+          from[2].j = ey;
+          from[2].k = ez;
+          from[2].loc = DMSTAG_LEFT;
+          from[2].c = 0;
+          from[3].i = ex;
+          from[3].j = ey;
+          from[3].k = ez;
+          from[3].loc = DMSTAG_RIGHT;
+          from[3].c = 0;
+          from[4].i = ex;
+          from[4].j = ey;
+          from[4].k = ez;
+          from[4].loc = DMSTAG_BACK;
+          from[4].c = 0;
+          from[5].i = ex;
+          from[5].j = ey;
+          from[5].k = ez;
+          from[5].loc = DMSTAG_FRONT;
+          from[5].c = 0;
+          PetscCall(DMStagVecGetValuesStencil(dm_stokes, stokesLocal, 6, from,
+                                              valFrom));
+          to[0].i = ex;
+          to[0].j = ey;
+          to[0].k = ez;
+          to[0].loc = DMSTAG_ELEMENT;
+          to[0].c = 0;
+          valTo[0] = 0.5 * (valFrom[2] + valFrom[3]);
+          to[1].i = ex;
+          to[1].j = ey;
+          to[1].k = ez;
+          to[1].loc = DMSTAG_ELEMENT;
+          to[1].c = 1;
+          valTo[1] = 0.5 * (valFrom[0] + valFrom[1]);
+          to[2].i = ex;
+          to[2].j = ey;
+          to[2].k = ez;
+          to[2].loc = DMSTAG_ELEMENT;
+          to[2].c = 2;
+          valTo[2] = 0.5 * (valFrom[4] + valFrom[5]);
+          PetscCall(DMStagVecSetValuesStencil(dm_vel_avg, vel_avg, 3, to, valTo,
+                                              INSERT_VALUES));
+        }
+      }
+    }
+  }
+  PetscCall(VecAssemblyBegin(vel_avg));
+  PetscCall(VecAssemblyEnd(vel_avg));
+  PetscCall(DMRestoreLocalVector(dm_stokes, &stokesLocal));
+
+  /* Create individual DMDAs for sub-grids of our DMStag objects. This is
+     somewhat inefficient, but allows use of the DMDA API without
+     re-implementing all utilities for DMStag */
+
+  PetscCall(
+      DMStagVecSplitToDMDA(dm_stokes, x, DMSTAG_ELEMENT, 0, &da_p, &vec_p));
+  PetscCall(PetscObjectSetName((PetscObject)vec_p, "p (scaled)"));
+
+  PetscCall(DMStagVecSplitToDMDA(dm_coefficients, coeff, DMSTAG_ELEMENT, 0,
+                                 &da_eta_element, &vec_eta_element));
+  PetscCall(PetscObjectSetName((PetscObject)vec_eta_element, "eta"));
+
+  PetscCall(DMStagVecSplitToDMDA(dm_coefficients, coeff, DMSTAG_DOWN_LEFT, 0,
+                                 &da_eta_down_left, &vec_eta_down_left));
+  PetscCall(PetscObjectSetName((PetscObject)vec_eta_down_left, "eta"));
+
+  PetscCall(DMStagVecSplitToDMDA(dm_coefficients, coeff, DMSTAG_DOWN_LEFT, 1,
+                                 &da_rho_down_left, &vec_rho_down_left));
+  PetscCall(PetscObjectSetName((PetscObject)vec_rho_down_left, "density"));
+
+  if (ctx->dim == 3) {
+    PetscCall(DMStagVecSplitToDMDA(dm_coefficients, coeff, DMSTAG_BACK_LEFT, 0,
+                                   &da_eta_back_left, &vec_eta_back_left));
+    PetscCall(PetscObjectSetName((PetscObject)vec_eta_back_left, "eta"));
+
+    PetscCall(DMStagVecSplitToDMDA(dm_coefficients, coeff, DMSTAG_BACK_LEFT, 1,
+                                   &da_rho_back_left, &vec_rho_back_left));
+    PetscCall(PetscObjectSetName((PetscObject)vec_rho_back_left, "rho"));
+
+    PetscCall(DMStagVecSplitToDMDA(dm_coefficients, coeff, DMSTAG_BACK_DOWN, 0,
+                                   &da_eta_back_down, &vec_eta_back_down));
+    PetscCall(PetscObjectSetName((PetscObject)vec_eta_back_down, "eta"));
+
+    PetscCall(DMStagVecSplitToDMDA(dm_coefficients, coeff, DMSTAG_BACK_DOWN, 1,
+                                   &da_rho_back_down, &vec_rho_back_down));
+    PetscCall(PetscObjectSetName((PetscObject)vec_rho_back_down, "rho"));
+  }
+
+  PetscCall(DMStagVecSplitToDMDA(dm_vel_avg, vel_avg, DMSTAG_ELEMENT, -3,
+                                 &da_vel_avg,
+                                 &vec_vel_avg)); /* note -3 : pad with zero */
+  PetscCall(
+      PetscObjectSetName((PetscObject)vec_vel_avg, "Velocity (Averaged)"));
+
+  /* Dump element-based fields to a .vtr file */
+  {
+    PetscViewer viewer;
+
+    PetscCall(PetscViewerVTKOpen(PetscObjectComm((PetscObject)da_vel_avg),
+                                 "ex4_element.vtr", FILE_MODE_WRITE, &viewer));
+    PetscCall(VecView(vec_vel_avg, viewer));
+    PetscCall(VecView(vec_p, viewer));
+    PetscCall(VecView(vec_eta_element, viewer));
+    PetscCall(PetscViewerDestroy(&viewer));
+  }
+
+  /* Dump vertex- or edge-based fields to a second .vtr file */
+  {
+    PetscViewer viewer;
+
+    PetscCall(PetscViewerVTKOpen(PetscObjectComm((PetscObject)da_eta_down_left),
+                                 "ex4_down_left.vtr", FILE_MODE_WRITE,
+                                 &viewer));
+    PetscCall(VecView(vec_eta_down_left, viewer));
+    PetscCall(VecView(vec_rho_down_left, viewer));
+    PetscCall(PetscViewerDestroy(&viewer));
+  }
+  if (ctx->dim == 3) {
+    PetscViewer viewer;
+
+    PetscCall(PetscViewerVTKOpen(PetscObjectComm((PetscObject)da_eta_back_left),
+                                 "ex4_back_left.vtr", FILE_MODE_WRITE,
+                                 &viewer));
+    PetscCall(VecView(vec_eta_back_left, viewer));
+    PetscCall(VecView(vec_rho_back_left, viewer));
+    PetscCall(PetscViewerDestroy(&viewer));
+  }
+  if (ctx->dim == 3) {
+    PetscViewer viewer;
+
+    PetscCall(PetscViewerVTKOpen(PetscObjectComm((PetscObject)da_eta_back_down),
+                                 "ex4_back_down.vtr", FILE_MODE_WRITE,
+                                 &viewer));
+    PetscCall(VecView(vec_eta_back_down, viewer));
+    PetscCall(VecView(vec_rho_back_down, viewer));
+    PetscCall(PetscViewerDestroy(&viewer));
+  }
+
+  /* Destroy DMDAs and Vecs */
+  PetscCall(VecDestroy(&vec_vel_avg));
+  PetscCall(VecDestroy(&vec_p));
+  PetscCall(VecDestroy(&vec_eta_element));
+  PetscCall(VecDestroy(&vec_eta_down_left));
+  if (ctx->dim == 3) {
+    PetscCall(VecDestroy(&vec_eta_back_left));
+    PetscCall(VecDestroy(&vec_eta_back_down));
+  }
+  PetscCall(VecDestroy(&vec_rho_down_left));
+  if (ctx->dim == 3) {
+    PetscCall(VecDestroy(&vec_rho_back_left));
+    PetscCall(VecDestroy(&vec_rho_back_down));
+  }
+  PetscCall(DMDestroy(&da_vel_avg));
+  PetscCall(DMDestroy(&da_p));
+  PetscCall(DMDestroy(&da_eta_element));
+  PetscCall(DMDestroy(&da_eta_down_left));
+  if (ctx->dim == 3) {
+    PetscCall(DMDestroy(&da_eta_back_left));
+    PetscCall(DMDestroy(&da_eta_back_down));
+  }
+  PetscCall(DMDestroy(&da_rho_down_left));
+  if (ctx->dim == 3) {
+    PetscCall(DMDestroy(&da_rho_back_left));
+    PetscCall(DMDestroy(&da_rho_back_down));
+  }
+  PetscCall(VecDestroy(&vel_avg));
+  PetscCall(DMDestroy(&dm_vel_avg));
+  PetscFunctionReturn(PETSC_SUCCESS);
 }
 
 /*TEST
 
    test:
-      args: -stokes_ksp_monitor_short -stokes_ksp_converged_reason
--stokes_pc_type lu
+      suffix: direct_umfpack
+      requires: suitesparse !complex
+      nsize: 1
+      args: -dim 2 -coefficients layers -nondimensional 0 -stag_grid_x 12
+-stag_grid_y 7 -pc_type lu -pc_factor_mat_solver_type umfpack
+-ksp_converged_reason
 
    test:
-      suffix: 2
-      nsize: 3
-      args: -stokes_ksp_monitor_short -stokes_ksp_converged_reason
--stokes_pc_type redundant -stokes_redundant_pc_type lu
-
-   test:
-      suffix: bddc_stokes
-      nsize: 6
-      args: -mx 5 -my 4 -mz 3 -stokes_ksp_monitor_short
--stokes_ksp_converged_reason -stokes_pc_type bddc -dm_mat_type is
--stokes_pc_bddc_dirichlet_pc_type svd -stokes_pc_bddc_neumann_pc_type svd
--stokes_pc_bddc_coarse_redundant_pc_type svd
-
-   test:
-      suffix: bddc_stokes_deluxe
-      nsize: 6
-      args: -mx 5 -my 4 -mz 3 -stokes_ksp_monitor_short
--stokes_ksp_converged_reason -stokes_pc_type bddc -dm_mat_type is
--stokes_pc_bddc_dirichlet_pc_type svd -stokes_pc_bddc_neumann_pc_type svd
--stokes_pc_bddc_coarse_redundant_pc_type svd -stokes_pc_bddc_use_deluxe_scaling
--stokes_sub_schurs_posdef 0 -stokes_sub_schurs_symmetric
--stokes_sub_schurs_mat_solver_type petsc
-
-   test:
-      requires: !single
-      suffix: bddc_stokes_subdomainjump_deluxe
+      suffix: direct_mumps
+      requires: mumps !complex !single
       nsize: 9
-      args: -model 4 -jump_magnitude 4 -mx 6 -my 6 -mz 2
--stokes_ksp_monitor_short -stokes_ksp_converged_reason -stokes_pc_type bddc
--dm_mat_type is -stokes_pc_bddc_use_deluxe_scaling -stokes_sub_schurs_posdef 0
--stokes_sub_schurs_symmetric -stokes_sub_schurs_mat_solver_type petsc
--stokes_pc_bddc_schur_layers 1
+      args: -dim 2 -coefficients layers -nondimensional 0 -stag_grid_x 13
+-stag_grid_y 8 -pc_type lu -pc_factor_mat_solver_type mumps
+-ksp_converged_reason
 
    test:
-      requires: !single
-      suffix: 3
-      args: -stokes_ksp_converged_reason -stokes_pc_type fieldsplit -resolve
+      suffix: isovisc_nondim_abf_mg
+      nsize: 1
+      args: -dim 2 -coefficients layers -nondimensional 1 -pc_type fieldsplit
+-pc_fieldsplit_type schur -ksp_converged_reason -fieldsplit_element_ksp_type
+preonly -pc_fieldsplit_detect_saddle_point false -fieldsplit_face_pc_type mg
+-fieldsplit_face_pc_mg_levels 3 -stag_grid_x 24 -stag_grid_y 24
+-fieldsplit_face_pc_mg_galerkin -fieldsplit_face_ksp_converged_reason -ksp_type
+fgmres -fieldsplit_element_pc_type none -fieldsplit_face_mg_levels_ksp_max_it 6
+-pc_fieldsplit_schur_fact_type upper -isoviscous
 
    test:
-      suffix: tut_1
+      suffix: isovisc_nondim_abf_mg_2
+      nsize: 1
+      args: -dim 2 -coefficients layers -nondimensional -isoviscous -eta1 1.0
+-stag_grid_x 32 -stag_grid_y 32 -ksp_type fgmres -pc_type fieldsplit
+-pc_fieldsplit_type schur -pc_fieldsplit_schur_fact_type upper
+-build_auxiliary_operator -fieldsplit_element_ksp_type preonly
+-fieldsplit_element_pc_type jacobi -fieldsplit_face_pc_type mg
+-fieldsplit_face_pc_mg_levels 3 -fieldsplit_face_pc_mg_galerkin
+-fieldsplit_face_mg_levels_pc_type jacobi -fieldsplit_face_mg_levels_ksp_type
+chebyshev -ksp_converged_reason
+
+   test:
+      suffix: nondim_abf_mg
+      requires: suitesparse !complex
       nsize: 4
-      requires: !single
-      args: -stokes_ksp_monitor
+      args: -dim 2 -coefficients layers -pc_type fieldsplit -pc_fieldsplit_type
+schur -ksp_converged_reason -fieldsplit_element_ksp_type preonly
+-pc_fieldsplit_detect_saddle_point false -fieldsplit_face_pc_type mg
+-fieldsplit_face_pc_mg_levels 3 -fieldsplit_face_pc_mg_galerkin
+-fieldsplit_face_mg_coarse_pc_type redundant
+-fieldsplit_face_mg_coarse_redundant_pc_type lu
+-fieldsplit_face_mg_coarse_redundant_pc_factor_mat_solver_type umfpack -ksp_type
+fgmres -fieldsplit_element_pc_type none -fieldsplit_face_mg_levels_ksp_max_it 6
+-pc_fieldsplit_schur_fact_type upper -nondimensional -eta1 1e-2 -eta2 1.0
+-ksp_monitor -fieldsplit_face_mg_levels_pc_type jacobi
+-fieldsplit_face_mg_levels_ksp_type gmres -fieldsplit_element_pc_type jacobi
+-pc_fieldsplit_schur_precondition selfp -stag_grid_x 32 -stag_grid_y 32
+-fieldsplit_face_ksp_monitor
 
    test:
-      suffix: tut_2
-      nsize: 4
-      requires: !single
-      args: -stokes_ksp_monitor -stokes_pc_type fieldsplit
--stokes_pc_fieldsplit_type schur
+      suffix: nondim_abf_lu
+      requires: suitesparse !complex
+      nsize: 1
+      args: -dim 2 -coefficients layers -pc_type fieldsplit -pc_fieldsplit_type
+schur -ksp_converged_reason -fieldsplit_element_ksp_type preonly
+-pc_fieldsplit_detect_saddle_point false -ksp_type fgmres
+-fieldsplit_element_pc_type none -pc_fieldsplit_schur_fact_type upper
+-nondimensional -eta1 1e-2 -eta2 1.0 -isoviscous 0 -ksp_monitor
+-fieldsplit_element_pc_type jacobi -build_auxiliary_operator
+-fieldsplit_face_pc_type lu -fieldsplit_face_pc_factor_mat_solver_type umfpack
+-stag_grid_x 32 -stag_grid_y 32
 
    test:
-      suffix: tut_3
-      nsize: 4
+      suffix: 3d_nondim_isovisc_abf_mg
       requires: !single
-      args: -mx 20 -stokes_ksp_monitor -stokes_pc_type fieldsplit
--stokes_pc_fieldsplit_type schur
+      nsize: 1
+      args: -dim 3 -coefficients layers -isoviscous -nondimensional
+-build_auxiliary_operator -pc_type fieldsplit -pc_fieldsplit_type schur
+-ksp_converged_reason -fieldsplit_element_ksp_type preonly
+-pc_fieldsplit_detect_saddle_point false -fieldsplit_face_pc_type mg
+-fieldsplit_face_pc_mg_levels 3 -s 16 -fieldsplit_face_pc_mg_galerkin
+-fieldsplit_face_ksp_converged_reason -ksp_type fgmres
+-fieldsplit_element_pc_type none -fieldsplit_face_mg_levels_ksp_max_it 6
+-pc_fieldsplit_schur_fact_type upper
+
+   test:
+      TODO: unstable across systems
+      suffix: monolithic
+      nsize: 1
+      requires: double !complex
+      args: -dim {{2 3}separate output} -s 16 -custom_pc_mat -pc_type mg
+-pc_mg_levels 3 -pc_mg_galerkin -mg_levels_ksp_type gmres
+-mg_levels_ksp_norm_type unpreconditioned -mg_levels_ksp_max_it 10
+-mg_levels_pc_type jacobi -ksp_converged_reason
+
+   test:
+      suffix: 3d_nondim_isovisc_sinker_abf_mg
+      requires: !complex !single
+      nsize: 1
+      args: -dim 3 -coefficients sinker -isoviscous -nondimensional -pc_type
+fieldsplit -pc_fieldsplit_type schur -ksp_converged_reason
+-fieldsplit_element_ksp_type preonly -pc_fieldsplit_detect_saddle_point false
+-fieldsplit_face_pc_type mg -fieldsplit_face_pc_mg_levels 3 -s 16
+-fieldsplit_face_pc_mg_galerkin -fieldsplit_face_ksp_converged_reason -ksp_type
+fgmres -fieldsplit_element_pc_type none -fieldsplit_face_mg_levels_ksp_max_it 6
+-pc_fieldsplit_schur_fact_type upper
+
+   test:
+      TODO: unstable across systems
+      suffix: 3d_nondim_mono_mg_lamemstyle
+      nsize: 1
+      requires: suitesparse
+      args: -dim 3 -coefficients layers -nondimensional -s 16 -custom_pc_mat
+-pc_type mg -pc_mg_galerkin -pc_mg_levels 2 -mg_levels_ksp_type richardson
+-mg_levels_pc_type jacobi -mg_levels_ksp_richardson_scale 0.5
+-mg_levels_ksp_max_it 20 -mg_coarse_pc_type lu
+-mg_coarse_pc_factor_mat_solver_type umfpack -ksp_converged_reason
+
+   test:
+      suffix: 3d_isovisc_blob_cuda
+      requires: cuda defined(PETSC_USE_LOG)
+      nsize: 2
+      args: -dim 3 -coefficients blob -isoviscous -s 8 -build_auxiliary_operator
+-fieldsplit_element_ksp_type preonly -fieldsplit_element_pc_type jacobi
+-fieldsplit_face_ksp_type fgmres -fieldsplit_face_mg_levels_ksp_max_it 6
+-fieldsplit_face_mg_levels_ksp_norm_type none
+-fieldsplit_face_mg_levels_ksp_type chebyshev -fieldsplit_face_mg_levels_pc_type
+jacobi -fieldsplit_face_pc_mg_galerkin -fieldsplit_face_pc_mg_levels 3
+-fieldsplit_face_pc_type mg -pc_fieldsplit_schur_fact_type upper
+-pc_fieldsplit_schur_precondition user -pc_fieldsplit_type schur -pc_type
+fieldsplit -dm_mat_type aijcusparse -dm_vec_type cuda -log_view
+-fieldsplit_face_pc_mg_log filter: awk "/MGInterp/ {print \$NF}"
 
 TEST*/

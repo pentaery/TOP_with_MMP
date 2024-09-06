@@ -58,7 +58,6 @@ int main(int argc, char **argv) {
   // PetscCall(KSPSetInitialGuessNonzero(ksp, PETSC_TRUE));
   PetscCall(KSPSetFromOptions(ksp));
 
-  PetscCall(PetscPrintf(PETSC_COMM_WORLD, "Using default vector\n"));
   PetscCall(VecSet(x, volfrac));
 
   PetscCall(formBoundary(&test));
@@ -72,53 +71,51 @@ int main(int argc, char **argv) {
 
   
 
-  // PC pc;
-  // PetscCall(KSPGetPC(ksp, &pc));
-  // if (!petsc_default) {
-  //   KSP kspCoarse, kspSmoother1, kspSmoother2;
-  //   PC pcCoarse, pcSmoother1, pcSmoother2;
-  //   Mat R_c, R_cc;
-  //   // 设置三层multigrid
-  //   PetscCall(KSPGetPC(ksp, &pc));
-  //   PetscCall(PCSetType(pc, PCMG));
-  //   PetscCall(PCMGSetLevels(pc, 3, NULL));
-  //   // 设为V-cycle
-  //   PetscCall(PCMGSetType(pc, PC_MG_MULTIPLICATIVE));
-  //   PetscCall(PCMGSetCycleType(pc, PC_MG_CYCLE_W));
-  //   // 设置coarse solver
-  //   PetscCall(PCMGGetCoarseSolve(pc, &kspCoarse));
-  //   PetscCall(KSPSetType(kspCoarse, KSPPREONLY));
-  //   PetscCall(KSPGetPC(kspCoarse, &pcCoarse));
-  //   PetscCall(PCSetType(pcCoarse, PCLU));
-  //   PetscCall(PCFactorSetMatSolverType(pcCoarse, MATSOLVERSUPERLU_DIST));
-  //   PetscCall(KSPSetErrorIfNotConverged(kspCoarse, PETSC_TRUE));
-  //   PetscCall(KSPSetUp(kspCoarse));
-  //   // 设置一阶smoother
-  //   PetscCall(PCMGGetSmoother(pc, 1, &kspSmoother1));
-  //   PetscCall(KSPGetPC(kspSmoother1, &pcSmoother1));
-  //   PetscCall(PCSetType(pcSmoother1, PCBJACOBI));
-  //   PetscCall(KSPSetErrorIfNotConverged(kspSmoother1, PETSC_TRUE));
-  //   PetscCall(KSPSetUp(kspSmoother1));
-  //   // 设置二阶smoother
-  //   PetscCall(PCMGGetSmoother(pc, 2, &kspSmoother2));
-  //   PetscCall(KSPGetPC(kspSmoother2, &pcSmoother2));
-  //   PetscCall(PCSetType(pcSmoother2, PCBJACOBI));
-  //   PetscCall(KSPSetErrorIfNotConverged(kspSmoother2, PETSC_TRUE));
-  //   PetscCall(KSPSetUp(kspSmoother2));
-  //   // 设置Prolongation
-  //   PetscCall(PCMGSetInterpolation(pc, 1, R_c));
-  //   PetscCall(PCMGSetInterpolation(pc, 2, R_cc));
-  //   // 设置工作变量
+  PC pc;
+  PetscCall(KSPGetPC(ksp, &pc));
+  if (!petsc_default) {
+    KSP kspCoarse, kspSmoother1, kspSmoother2;
+    PC pcCoarse, pcSmoother1, pcSmoother2;
+    // 设置三层multigrid
+    PetscCall(PCSetType(pc, PCMG));
+    PetscCall(PCMGSetLevels(pc, 3, NULL));
+    // 设为V-cycle
+    PetscCall(PCMGSetType(pc, PC_MG_MULTIPLICATIVE));
+    PetscCall(PCMGSetCycleType(pc, PC_MG_CYCLE_V));
+    // 设置coarse solver
+    PetscCall(PCMGGetCoarseSolve(pc, &kspCoarse));
+    PetscCall(KSPSetType(kspCoarse, KSPPREONLY));
+    PetscCall(KSPGetPC(kspCoarse, &pcCoarse));
+    PetscCall(PCSetType(pcCoarse, PCLU));
+    PetscCall(PCFactorSetMatSolverType(pcCoarse, MATSOLVERSUPERLU_DIST));
+    PetscCall(KSPSetErrorIfNotConverged(kspCoarse, PETSC_TRUE));
+    PetscCall(KSPSetUp(kspCoarse));
+    // 设置一阶smoother
+    PetscCall(PCMGGetSmoother(pc, 2, &kspSmoother1));
+    PetscCall(KSPGetPC(kspSmoother1, &pcSmoother1));
+    PetscCall(PCSetType(pcSmoother1, PCBJACOBI));
+    PetscCall(KSPSetErrorIfNotConverged(kspSmoother1, PETSC_TRUE));
+    PetscCall(KSPSetUp(kspSmoother1));
+    // 设置二阶smoother
+    PetscCall(PCMGGetSmoother(pc, 1, &kspSmoother2));
+    PetscCall(KSPGetPC(kspSmoother2, &pcSmoother2));
+    PetscCall(PCSetType(pcSmoother2, PCBJACOBI));
+    PetscCall(KSPSetErrorIfNotConverged(kspSmoother2, PETSC_TRUE));
+    PetscCall(KSPSetUp(kspSmoother2));
+    // 设置Prolongation
+    PetscCall(PCMGSetInterpolation(pc, 2, test.Rc));
+    PetscCall(PCMGSetInterpolation(pc, 1, test.Rcc));
+    // 设置工作变量
 
-  //   PetscCall(
-  //       PCShellSetName(pc, "3levels-MG-via-GMsFEM-with-velocity-elimination"));
-  // } else {
-  //   PetscCall(PCSetType(pc, PCGAMG));
-  // }
+    PetscCall(
+        PCShellSetName(pc, "3levels-MG-via-GMsFEM-with-velocity-elimination"));
+  } else {
+    PetscCall(PCSetType(pc, PCGAMG));
+  }
 
-  // PetscCall(KSPSolve(ksp, rhs, t));
+  PetscCall(KSPSolve(ksp, rhs, t));
 
-  // PetscCall(KSPConvergedReasonView(ksp, PETSC_VIEWER_STDOUT_WORLD));
+  PetscCall(KSPConvergedReasonView(ksp, PETSC_VIEWER_STDOUT_WORLD));
 
   PetscCall(MatDestroy(&A));
   PetscCall(VecDestroy(&rhs));
