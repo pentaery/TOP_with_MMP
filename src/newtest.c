@@ -14,6 +14,7 @@
 #include <petscmat.h>
 #include <petscoptions.h>
 #include <petscpc.h>
+#include <petscpctypes.h>
 #include <petscsys.h>
 #include <petscsystypes.h>
 #include <petsctime.h>
@@ -68,9 +69,19 @@ int main(int argc, char **argv) {
   PetscCall(KSPSetOperators(ksp, A, A));
 
   PetscCall(PC_setup(&test));
+  PetscCall(MatView(test.Rcc, PETSC_VIEWER_STDOUT_WORLD));
 
-  
-
+  Vec rhsc, rhscc;
+  Vec xfine, xc, xcc;
+  Vec r, rc, rcc;
+  PetscCall(DMCreateGlobalVector(test.dm, &r));
+  PetscCall(DMCreateGlobalVector(test.dm, &xfine));
+  PetscCall(MatCreateVecs(test.Rc, &xc, NULL));
+  PetscCall(MatCreateVecs(test.Rc, &rc, NULL));
+  PetscCall(MatCreateVecs(test.Rc, &rhsc, NULL));
+  PetscCall(MatCreateVecs(test.Rcc, &xcc, NULL));
+  PetscCall(MatCreateVecs(test.Rcc, &rcc, NULL));
+  PetscCall(MatCreateVecs(test.Rcc, &rhscc, NULL));
   PC pc;
   PetscCall(KSPGetPC(ksp, &pc));
   if (!petsc_default) {
@@ -82,6 +93,7 @@ int main(int argc, char **argv) {
     // 设为V-cycle
     PetscCall(PCMGSetType(pc, PC_MG_MULTIPLICATIVE));
     PetscCall(PCMGSetCycleType(pc, PC_MG_CYCLE_V));
+    PetscCall(PCMGSetGalerkin(pc, PC_MG_GALERKIN_BOTH));
     // 设置coarse solver
     PetscCall(PCMGGetCoarseSolve(pc, &kspCoarse));
     PetscCall(KSPSetType(kspCoarse, KSPPREONLY));
@@ -89,24 +101,27 @@ int main(int argc, char **argv) {
     PetscCall(PCSetType(pcCoarse, PCLU));
     PetscCall(PCFactorSetMatSolverType(pcCoarse, MATSOLVERSUPERLU_DIST));
     PetscCall(KSPSetErrorIfNotConverged(kspCoarse, PETSC_TRUE));
-    PetscCall(KSPSetUp(kspCoarse));
     // 设置一阶smoother
     PetscCall(PCMGGetSmoother(pc, 2, &kspSmoother1));
     PetscCall(KSPGetPC(kspSmoother1, &pcSmoother1));
     PetscCall(PCSetType(pcSmoother1, PCBJACOBI));
     PetscCall(KSPSetErrorIfNotConverged(kspSmoother1, PETSC_TRUE));
-    PetscCall(KSPSetUp(kspSmoother1));
     // 设置二阶smoother
     PetscCall(PCMGGetSmoother(pc, 1, &kspSmoother2));
     PetscCall(KSPGetPC(kspSmoother2, &pcSmoother2));
     PetscCall(PCSetType(pcSmoother2, PCBJACOBI));
     PetscCall(KSPSetErrorIfNotConverged(kspSmoother2, PETSC_TRUE));
-    PetscCall(KSPSetUp(kspSmoother2));
     // 设置Prolongation
     PetscCall(PCMGSetInterpolation(pc, 2, test.Rc));
     PetscCall(PCMGSetInterpolation(pc, 1, test.Rcc));
     // 设置工作变量
-
+    // PetscCall(PCMGSetX(pc, 0, xcc));
+    // PetscCall(PCMGSetRhs(pc, 0, rhscc));
+    // PetscCall(PCMGSetX(pc, 1, xc));
+    // PetscCall(PCMGSetRhs(pc, 1, rhsc));
+    // PetscCall(PCMGSetR(pc, 1, rc));
+    // PetscCall(PCMGSetX(pc, 2, xfine));
+    // PetscCall(PCMGSetRhs(pc, 2, rhs));
     PetscCall(
         PCShellSetName(pc, "3levels-MG-via-GMsFEM-with-velocity-elimination"));
   } else {

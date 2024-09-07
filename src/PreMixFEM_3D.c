@@ -314,8 +314,8 @@ PetscErrorCode formRc(PCCtx *s_ctx, _IntCtx *int_ctx) {
                                   &arr_eig_vec[ez - startz][ey - starty][0],
                                   nx));
           for (ex = startx; ex < startx + nx; ++ex) {
-            colRc = firstcol + (ez - startz) * proc_ny * proc_nx +
-                    (ey - starty) * proc_nx + ex - startx;
+            colRc = firstcol + (ez - proc_startz) * proc_ny * proc_nx +
+                    (ey - proc_starty) * proc_nx + ex - proc_startx;
             PetscCall(
                 MatSetValue(s_ctx->Rc, rowRc, colRc,
                             arr_eig_vec[ez - startz][ey - starty][ex - startx],
@@ -693,7 +693,8 @@ PetscErrorCode formRcc(PCCtx *s_ctx, _IntCtx *int_ctx) {
 
   // PetscScalar value;
   // PetscCall(MatGetValue(s_ctx->Rcc, firstrow+1, firstcol, &value));
-  // PetscCall(PetscPrintf(PETSC_COMM_SELF, "firstrow=%d, firstcol=%d\n", firstrow,
+  // PetscCall(PetscPrintf(PETSC_COMM_SELF, "firstrow=%d, firstcol=%d\n",
+  // firstrow,
   //                       firstcol));
   // PetscCall(PetscPrintf(PETSC_COMM_SELF, "value: %f\n", value));
 
