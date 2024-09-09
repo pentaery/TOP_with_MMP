@@ -55,11 +55,7 @@ PetscErrorCode PC_init(PCCtx *s_ctx, PetscScalar *dom, PetscInt *mesh);
    partions in z-direction.
 */
 
-PetscErrorCode PC_print_info(PCCtx *s_ctx);
-
 PetscErrorCode PC_setup(PCCtx *s_ctx);
-
-PetscErrorCode PC_final_default(PCCtx *s_ctx);
 
 PetscErrorCode PC_final(PCCtx *s_ctx);
 

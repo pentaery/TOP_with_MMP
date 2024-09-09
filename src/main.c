@@ -31,7 +31,7 @@ int main(int argc, char **argv) {
   PetscInt iter_number = 60;
   PetscInt output_frequency = 10;
   PetscLogEvent linearsolve, optimize;
-  PetscBool xvalue_default = PETSC_FALSE;
+  PetscBool xvalue_default = PETSC_TRUE, petsc_default = PETSC_FALSE;
   char filename[80] = "hello.txt";
   PetscCall(PetscLogEventRegister("LinearSolve", 0, &linearsolve));
   PetscCall(PetscLogEventRegister("Optimization", 1, &optimize));
@@ -40,6 +40,7 @@ int main(int argc, char **argv) {
   PetscCall(PetscOptionsGetInt(NULL, NULL, "-iter", &iter_number, NULL));
   PetscCall(
       PetscOptionsHasName(NULL, NULL, "-xvalue_default", &xvalue_default));
+  PetscCall(PetscOptionsHasName(NULL, NULL, "-petsc_default", &petsc_default));
   PetscCall(
       PetscOptionsGetInt(NULL, NULL, "-frequency", &output_frequency, NULL));
   PetscCall(PetscOptionsGetString(NULL, NULL, "-itername", filename, 20, NULL));
@@ -127,8 +128,44 @@ int main(int argc, char **argv) {
 
     PC pc;
     PetscCall(KSPGetPC(ksp, &pc));
-
-    PetscCall(PCSetType(pc, PCGAMG));
+    if (!petsc_default) {
+      PetscCall(PC_setup(&test));
+      PetscCall(PetscPrintf(PETSC_COMM_WORLD, "Using GMsFEM\n"));
+      KSP kspCoarse, kspSmoother1, kspSmoother2;
+      PC pcCoarse, pcSmoother1, pcSmoother2;
+      // 设置三层multigrid
+      PetscCall(PCSetType(pc, PCMG));
+      PetscCall(PCMGSetLevels(pc, 3, NULL));
+      // 设为V-cycle
+      PetscCall(PCMGSetType(pc, PC_MG_MULTIPLICATIVE));
+      PetscCall(PCMGSetCycleType(pc, PC_MG_CYCLE_V));
+      PetscCall(PCMGSetGalerkin(pc, PC_MG_GALERKIN_BOTH));
+      // 设置coarse solver
+      PetscCall(PCMGGetCoarseSolve(pc, &kspCoarse));
+      PetscCall(KSPSetType(kspCoarse, KSPPREONLY));
+      PetscCall(KSPGetPC(kspCoarse, &pcCoarse));
+      PetscCall(PCSetType(pcCoarse, PCLU));
+      PetscCall(PCFactorSetMatSolverType(pcCoarse, MATSOLVERSUPERLU_DIST));
+      PetscCall(KSPSetErrorIfNotConverged(kspCoarse, PETSC_TRUE));
+      // 设置一阶smoother
+      PetscCall(PCMGGetSmoother(pc, 2, &kspSmoother1));
+      PetscCall(KSPGetPC(kspSmoother1, &pcSmoother1));
+      PetscCall(PCSetType(pcSmoother1, PCBJACOBI));
+      PetscCall(KSPSetErrorIfNotConverged(kspSmoother1, PETSC_TRUE));
+      // 设置二阶smoother
+      PetscCall(PCMGGetSmoother(pc, 1, &kspSmoother2));
+      PetscCall(KSPGetPC(kspSmoother2, &pcSmoother2));
+      PetscCall(PCSetType(pcSmoother2, PCBJACOBI));
+      PetscCall(KSPSetErrorIfNotConverged(kspSmoother2, PETSC_TRUE));
+      // 设置Prolongation
+      PetscCall(PCMGSetInterpolation(pc, 2, test.Rc));
+      PetscCall(PCMGSetInterpolation(pc, 1, test.Rcc));
+      PetscCall(PCShellSetName(
+          pc, "3levels-MG-via-GMsFEM-with-velocity-elimination"));
+    } else {
+      PetscCall(PetscPrintf(PETSC_COMM_WORLD, "Using GAMG\n"));
+      PetscCall(PCSetType(pc, PCGAMG));
+    }
 
     PetscCall(PetscLogEventBegin(linearsolve, 0, 0, 0, 0));
 

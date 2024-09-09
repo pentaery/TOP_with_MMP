@@ -68,7 +68,7 @@ int main(int argc, char **argv) {
   PetscCall(formRHS(&test, rhs, x, penal));
   PetscCall(KSPSetOperators(ksp, A, A));
 
-  // PetscCall(PC_setup(&test));
+  PetscCall(PC_setup(&test));
   // PetscCall(MatView(test.Rcc, PETSC_VIEWER_STDOUT_WORLD));
 
   PC pc;
@@ -104,14 +104,6 @@ int main(int argc, char **argv) {
     // 设置Prolongation
     PetscCall(PCMGSetInterpolation(pc, 2, test.Rc));
     PetscCall(PCMGSetInterpolation(pc, 1, test.Rcc));
-    // 设置工作变量
-    // PetscCall(PCMGSetX(pc, 0, xcc));
-    // PetscCall(PCMGSetRhs(pc, 0, rhscc));
-    // PetscCall(PCMGSetX(pc, 1, xc));
-    // PetscCall(PCMGSetRhs(pc, 1, rhsc));
-    // PetscCall(PCMGSetR(pc, 1, rc));
-    // PetscCall(PCMGSetX(pc, 2, xfine));
-    // PetscCall(PCMGSetRhs(pc, 2, rhs));
     PetscCall(
         PCShellSetName(pc, "3levels-MG-via-GMsFEM-with-velocity-elimination"));
   } else {
