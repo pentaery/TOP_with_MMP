@@ -93,7 +93,7 @@ PetscErrorCode formRc(PCCtx *s_ctx, _IntCtx *int_ctx) {
   PetscFunctionBeginUser;
 
   Mat A_i_inner, M_i;
-  Vec diag_M_i, getIndex;
+  Vec diag_M_i;
   PetscScalar ***arr_ms_bases_c_array[s_ctx->max_eigen_num_lv1], ***arr_M_i_3d,
       val_A[2][2], avg_kappa_e;
   PetscInt i, j, coarse_elem, startx, nx, ex, starty, ny, ey, startz, nz, ez,
@@ -102,8 +102,7 @@ PetscErrorCode formRc(PCCtx *s_ctx, _IntCtx *int_ctx) {
   PetscInt proc_nx, proc_ny, proc_nz, proc_startx, proc_starty, proc_startz;
   PetscCall(DMDAGetCorners(s_ctx->dm, &proc_startx, &proc_starty, &proc_startz,
                            &proc_nx, &proc_ny, &proc_nz));
-  PetscCall(DMGetGlobalVector(s_ctx->dm, &getIndex));
-  PetscCall(VecGetOwnershipRange(getIndex, &firstcol, &lastcol));
+  PetscCall(MatGetOwnershipRange(s_ctx->Rcc, &firstcol, &lastcol));
   PetscCall(MatGetOwnershipRange(s_ctx->Rc, &firstrow, &lastrow));
 
   for (i = 0; i < s_ctx->max_eigen_num_lv1; ++i) {
@@ -306,7 +305,7 @@ PetscErrorCode formRc(PCCtx *s_ctx, _IntCtx *int_ctx) {
       if (j == s_ctx->max_eigen_num_lv1 - 1) {
         s_ctx->eigen_max_lv1[coarse_elem] = eig_val;
       }
-      rowRc = firstrow + coarse_elem * s_ctx->max_eigen_num_lv1 + j;
+      colRc = firstcol + coarse_elem * s_ctx->max_eigen_num_lv1 + j;
       PetscCall(VecGetArray3d(eig_vec, nz, ny, nx, 0, 0, 0, &arr_eig_vec));
       for (ez = startz; ez < startz + nz; ++ez)
         for (ey = starty; ey < starty + ny; ++ey) {
@@ -314,7 +313,7 @@ PetscErrorCode formRc(PCCtx *s_ctx, _IntCtx *int_ctx) {
                                   &arr_eig_vec[ez - startz][ey - starty][0],
                                   nx));
           for (ex = startx; ex < startx + nx; ++ex) {
-            colRc = firstcol + (ez - proc_startz) * proc_ny * proc_nx +
+            rowRc = firstrow + (ez - proc_startz) * proc_ny * proc_nx +
                     (ey - proc_starty) * proc_nx + ex - proc_startx;
             PetscCall(
                 MatSetValue(s_ctx->Rc, rowRc, colRc,
@@ -355,7 +354,6 @@ PetscErrorCode formRc(PCCtx *s_ctx, _IntCtx *int_ctx) {
                               int_ctx->ms_bases_c_tmp[i]));
   }
   PetscCall(DMRestoreGlobalVector(s_ctx->dm, &dummy_ms_bases_glo));
-  PetscCall(VecDestroy(&getIndex));
   PetscFunctionReturn(0);
 }
 
@@ -363,7 +361,6 @@ PetscErrorCode formRcc(PCCtx *s_ctx, _IntCtx *int_ctx) {
   PetscFunctionBeginUser;
 
   Mat A_i_inner;
-  Vec dummy_ms_bases_glo;
   PetscInt coarse_elem, coarse_elem_col, i, j, row, col;
   PetscInt coarse_elem_x, coarse_elem_y, coarse_elem_z, startx, nx, ex, starty,
       ny, ey, startz, nz, ez;
@@ -651,15 +648,15 @@ PetscErrorCode formRcc(PCCtx *s_ctx, _IntCtx *int_ctx) {
              nconv, s_ctx->max_eigen_num_lv2);
   PetscCall(MatCreateVecs(A_i_inner, &eig_vec, NULL));
 
-  PetscInt firstrow, firstcol, rowRcc;
-  PetscInt colRcc[int_ctx->coarse_elem_num * s_ctx->max_eigen_num_lv1];
+  PetscInt firstrow, firstcol, colRcc;
+  PetscInt rowRcc[int_ctx->coarse_elem_num * s_ctx->max_eigen_num_lv1];
 
   Vec getIndex;
   PetscCall(MatCreateVecs(s_ctx->Rcc, &getIndex, NULL));
   PetscCall(VecGetOwnershipRange(getIndex, &firstcol, NULL));
   PetscCall(MatGetOwnershipRange(s_ctx->Rcc, &firstrow, NULL));
   for (i = 0; i < int_ctx->coarse_elem_num * s_ctx->max_eigen_num_lv1; ++i)
-    colRcc[i] = firstcol + i;
+    rowRcc[i] = firstrow + i;
 
   for (j = 0; j < s_ctx->max_eigen_num_lv2; ++j) {
     PetscCall(EPSGetEigenpair(eps, j, &eig_val, NULL, eig_vec, NULL));
@@ -669,11 +666,11 @@ PetscErrorCode formRcc(PCCtx *s_ctx, _IntCtx *int_ctx) {
     if (j == s_ctx->max_eigen_num_lv2 - 1) {
       s_ctx->eigen_max_lv2 = eig_val;
     }
-    rowRcc = firstrow + j;
+    colRcc = firstcol + j;
     PetscCall(VecGetArray(eig_vec, &arr_eig_vec));
-    PetscCall(MatSetValues(s_ctx->Rcc, 1, &rowRcc,
+    PetscCall(MatSetValues(s_ctx->Rcc,
                            int_ctx->coarse_elem_num * s_ctx->max_eigen_num_lv1,
-                           colRcc, arr_eig_vec, INSERT_VALUES));
+                           rowRcc, 1, &colRcc, arr_eig_vec, INSERT_VALUES));
     PetscCall(VecRestoreArray(eig_vec, &arr_eig_vec));
   }
 
@@ -736,14 +733,14 @@ PetscErrorCode PC_setup(PCCtx *s_ctx) {
       s_ctx->coarse_lenx[0] * s_ctx->coarse_leny[0] * s_ctx->coarse_lenz[0];
   PetscCallMPI(MPI_Allreduce(&eigen_len_lv1, &eigen_len_lv1_max, 1, MPI_INT,
                              MPI_MAX, PETSC_COMM_WORLD));
-  PetscCall(
-      MatCreateAIJ(PETSC_COMM_WORLD, coarse_elem_num * s_ctx->max_eigen_num_lv1,
-                   proc_nx * proc_ny * proc_nz, PETSC_DEFAULT, PETSC_DEFAULT,
-                   eigen_len_lv1_max, NULL, 0, NULL, &s_ctx->Rc));
+  PetscCall(MatCreateAIJ(PETSC_COMM_WORLD, proc_nx * proc_ny * proc_nz,
+                         coarse_elem_num * s_ctx->max_eigen_num_lv1,
+                         PETSC_DEFAULT, PETSC_DEFAULT, eigen_len_lv1_max, NULL,
+                         0, NULL, &s_ctx->Rc));
 
   PetscCall(MatCreateAIJ(
-      PETSC_COMM_WORLD, s_ctx->max_eigen_num_lv2,
-      coarse_elem_num * s_ctx->max_eigen_num_lv1, PETSC_DEFAULT, PETSC_DEFAULT,
+      PETSC_COMM_WORLD, coarse_elem_num * s_ctx->max_eigen_num_lv1,
+      s_ctx->max_eigen_num_lv2, PETSC_DEFAULT, PETSC_DEFAULT,
       coarse_elem_num * s_ctx->max_eigen_num_lv1, NULL, 0, NULL, &s_ctx->Rcc));
 
   PetscInt m, n;
@@ -786,7 +783,7 @@ PetscErrorCode PC_init(PCCtx *s_ctx, PetscScalar *dom, PetscInt *mesh) {
   PetscCheck(s_ctx->sub_domains >= 1, PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
              "Error in sub_domains=%d.\n", s_ctx->sub_domains);
 
-  s_ctx->max_eigen_num_lv1 = 1;
+  s_ctx->max_eigen_num_lv1 = 4;
   PetscCall(PetscOptionsGetInt(NULL, NULL, "-en_lv1", &s_ctx->max_eigen_num_lv1,
                                NULL));
   PetscCheck(s_ctx->max_eigen_num_lv1 >= 1, PETSC_COMM_WORLD,
@@ -794,7 +791,7 @@ PetscErrorCode PC_init(PCCtx *s_ctx, PetscScalar *dom, PetscInt *mesh) {
              "Error in max_eigen_num_lv1=%d for the level-1 problem.\n",
              s_ctx->max_eigen_num_lv1);
 
-  s_ctx->max_eigen_num_lv2 = 1;
+  s_ctx->max_eigen_num_lv2 = 4;
 
   PetscCall(PetscOptionsGetInt(NULL, NULL, "-en_lv2", &s_ctx->max_eigen_num_lv2,
                                NULL));
