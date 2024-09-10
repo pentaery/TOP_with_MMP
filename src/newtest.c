@@ -68,12 +68,13 @@ int main(int argc, char **argv) {
   PetscCall(formRHS(&test, rhs, x, penal));
   PetscCall(KSPSetOperators(ksp, A, A));
 
-  PetscCall(PC_setup(&test));
   // PetscCall(MatView(test.Rcc, PETSC_VIEWER_STDOUT_WORLD));
-
+  PetscLogDouble time;
+  PetscTime(&time);
   PC pc;
   PetscCall(KSPGetPC(ksp, &pc));
   if (!petsc_default) {
+    PetscCall(PC_setup(&test));
     PetscCall(PetscPrintf(PETSC_COMM_WORLD, "Using GMsFEM\n"));
     KSP kspCoarse, kspSmoother1, kspSmoother2;
     PC pcCoarse, pcSmoother1, pcSmoother2;
@@ -95,12 +96,14 @@ int main(int argc, char **argv) {
     PetscCall(PCMGGetSmoother(pc, 2, &kspSmoother1));
     PetscCall(KSPGetPC(kspSmoother1, &pcSmoother1));
     PetscCall(PCSetType(pcSmoother1, PCBJACOBI));
-    PetscCall(KSPSetErrorIfNotConverged(kspSmoother1, PETSC_TRUE));
+    PetscCall(
+        KSPSetTolerances(kspSmoother1, PETSC_DEFAULT, PETSC_DEFAULT, PETSC_DEFAULT, 5));
     // 设置二阶smoother
     PetscCall(PCMGGetSmoother(pc, 1, &kspSmoother2));
     PetscCall(KSPGetPC(kspSmoother2, &pcSmoother2));
     PetscCall(PCSetType(pcSmoother2, PCBJACOBI));
-    PetscCall(KSPSetErrorIfNotConverged(kspSmoother2, PETSC_TRUE));
+    PetscCall(
+        KSPSetTolerances(kspSmoother2, PETSC_DEFAULT, PETSC_DEFAULT, PETSC_DEFAULT, 5));
     // 设置Prolongation
     PetscCall(PCMGSetInterpolation(pc, 2, test.Rc));
     PetscCall(PCMGSetInterpolation(pc, 1, test.Rcc));
@@ -110,11 +113,10 @@ int main(int argc, char **argv) {
     PetscCall(PetscPrintf(PETSC_COMM_WORLD, "Using GAMG\n"));
     PetscCall(PCSetType(pc, PCGAMG));
   }
-  PetscLogDouble time;
-  PetscTime(&time);
+
   PetscCall(KSPSolve(ksp, rhs, t));
   PetscTimeSubtract(&time);
-  PetscPrintf(PETSC_COMM_WORLD, "Time: %f\n", time);
+  PetscPrintf(PETSC_COMM_WORLD, "Time: %f\n", -time);
 
   PetscCall(KSPConvergedReasonView(ksp, PETSC_VIEWER_STDOUT_WORLD));
 
@@ -126,6 +128,7 @@ int main(int argc, char **argv) {
 
   PetscCall(KSPDestroy(&ksp));
   // PetscCall(mmaFinal(&mmax));
+  PetscCall(PC_final(&test));
 
   PetscCall(SlepcFinalize());
 }

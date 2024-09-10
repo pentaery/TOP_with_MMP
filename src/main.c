@@ -70,7 +70,7 @@ int main(int argc, char **argv) {
   PetscCall(PetscObjectSetName((PetscObject)mmax.xlast, "Design Variable"));
   PetscCall(PetscObjectSetName((PetscObject)t, "Temperature"));
   PetscCall(KSPCreate(PETSC_COMM_WORLD, &ksp));
-  PetscCall(KSPSetType(ksp, KSPGCR));
+  PetscCall(KSPSetType(ksp, KSPCG));
   PetscCall(KSPSetNormType(ksp, KSP_NORM_UNPRECONDITIONED));
   PetscCall(
       KSPSetTolerances(ksp, 1e-6, PETSC_DEFAULT, PETSC_DEFAULT, PETSC_DEFAULT));

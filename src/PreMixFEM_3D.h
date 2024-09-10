@@ -46,6 +46,9 @@ typedef struct preconditioner_context {
   PetscInt M, N, P;
   // 网格数
   Mat Rc, Rcc;
+  PetscScalar meas_elem, meas_face_xy, meas_face_yz, meas_face_zx;
+  PetscInt coarse_elem_num;
+  Vec *ms_bases_c_tmp;
 } PCCtx;
 
 PetscErrorCode PC_init(PCCtx *s_ctx, PetscScalar *dom, PetscInt *mesh);
