@@ -30,11 +30,11 @@ int main(int argc, char **argv) {
   PetscInt grid = 20;
   PetscInt iter_number = 60;
   PetscInt output_frequency = 10;
-  PetscLogEvent linearsolve, optimize;
+  PetscLogEvent LS1, optimize, setUp;
   PetscBool xvalue_default = PETSC_TRUE, petsc_default = PETSC_FALSE;
-  char filename[80] = "hello.txt";
-  PetscCall(PetscLogEventRegister("LinearSolve", 0, &linearsolve));
+  PetscCall(PetscLogEventRegister("LS1", 0, &LS1));
   PetscCall(PetscLogEventRegister("Optimization", 1, &optimize));
+  PetscCall(PetscLogEventRegister("setUp", 2, &setUp));
 
   PetscCall(PetscOptionsGetInt(NULL, NULL, "-mesh", &grid, NULL));
   PetscCall(PetscOptionsGetInt(NULL, NULL, "-iter", &iter_number, NULL));
@@ -43,10 +43,10 @@ int main(int argc, char **argv) {
   PetscCall(PetscOptionsHasName(NULL, NULL, "-petsc_default", &petsc_default));
   PetscCall(
       PetscOptionsGetInt(NULL, NULL, "-frequency", &output_frequency, NULL));
-  PetscCall(PetscOptionsGetString(NULL, NULL, "-itername", filename, 20, NULL));
   PetscInt mesh[3] = {grid, grid, grid};
   PetscScalar dom[3] = {1.0, 1.0, 1.0};
   PetscScalar cost = 0;
+  PetscLogDouble mmatime[iter_number];
   PetscInt it[iter_number];
   PetscScalar tem[iter_number];
   Mat A;
@@ -94,6 +94,7 @@ int main(int argc, char **argv) {
 
   PetscCall(formBoundary(&test));
   while (PETSC_TRUE) {
+    PetscCall(PetscTime(&mmatime[loop]));
     if (loop >= iter_number) {
       break;
     }
@@ -128,8 +129,11 @@ int main(int argc, char **argv) {
 
     PC pc;
     PetscCall(KSPGetPC(ksp, &pc));
+
     if (!petsc_default) {
+      PetscCall(PetscLogEventBegin(setUp, 0, 0, 0, 0));
       PetscCall(PC_setup(&test));
+      PetscCall(PetscLogEventEnd(setUp, 0, 0, 0, 0));
       PetscCall(PetscPrintf(PETSC_COMM_WORLD, "Using GMsFEM\n"));
       KSP kspCoarse, kspSmoother1, kspSmoother2;
       PC pcCoarse, pcSmoother1, pcSmoother2;
@@ -149,14 +153,16 @@ int main(int argc, char **argv) {
       PetscCall(KSPSetErrorIfNotConverged(kspCoarse, PETSC_TRUE));
       // 设置一阶smoother
       PetscCall(PCMGGetSmoother(pc, 2, &kspSmoother1));
+      PetscCall(KSPSetTolerances(kspSmoother1, PETSC_DEFAULT, PETSC_DEFAULT,
+                                 PETSC_DEFAULT, 1));
       PetscCall(KSPGetPC(kspSmoother1, &pcSmoother1));
       PetscCall(PCSetType(pcSmoother1, PCBJACOBI));
-      PetscCall(KSPSetErrorIfNotConverged(kspSmoother1, PETSC_TRUE));
       // 设置二阶smoother
       PetscCall(PCMGGetSmoother(pc, 1, &kspSmoother2));
+      PetscCall(KSPSetTolerances(kspSmoother2, PETSC_DEFAULT, PETSC_DEFAULT,
+                                 PETSC_DEFAULT, 1));
       PetscCall(KSPGetPC(kspSmoother2, &pcSmoother2));
       PetscCall(PCSetType(pcSmoother2, PCBJACOBI));
-      PetscCall(KSPSetErrorIfNotConverged(kspSmoother2, PETSC_TRUE));
       // 设置Prolongation
       PetscCall(PCMGSetInterpolation(pc, 2, test.Rc));
       PetscCall(PCMGSetInterpolation(pc, 1, test.Rcc));
@@ -167,11 +173,9 @@ int main(int argc, char **argv) {
       PetscCall(PCSetType(pc, PCGAMG));
     }
 
-    PetscCall(PetscLogEventBegin(linearsolve, 0, 0, 0, 0));
-
+    PetscCall(PetscLogEventBegin(LS1, 0, 0, 0, 0));
     PetscCall(KSPSolve(ksp, rhs, t));
-
-    PetscCall(PetscLogEventEnd(linearsolve, 0, 0, 0, 0));
+    PetscCall(PetscLogEventEnd(LS1, 0, 0, 0, 0));
 
     PetscCall(KSPConvergedReasonView(ksp, PETSC_VIEWER_STDOUT_WORLD));
     PetscCall(KSPGetIterationNumber(ksp, &iter));
@@ -196,25 +200,28 @@ int main(int argc, char **argv) {
 
     PetscCall(computeChange(&mmax, x, &change));
     PetscCall(PetscPrintf(PETSC_COMM_WORLD, "change: %f\n", change));
+    PetscCall(PetscTimeSubtract(&mmatime[loop - 1]));
   }
 
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD, "MMA time: \n"));
+  for (loop = 0; loop < iter_number; ++loop) {
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD, "%f, ", -mmatime[loop]));
+  }
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD, "\n"));
+
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD, "iteration: \n"));
+  for (loop = 0; loop < iter_number; ++loop) {
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD, "%d, ", it[loop]));
+  }
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD, "\n"));
+
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD, "cost function: \n"));
+  for (loop = 0; loop < iter_number; ++loop) {
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD, "%f, ", tem[loop]));
+  }
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD, "\n"));
 
   PetscCall(PC_final(&test));
-
-
-  FILE *fp = fopen(filename, "w");
-  if (fp == NULL) {
-    printf("Error opening file\n");
-    return 1;
-  }
-  for (int i = 0; i < iter_number; i++) {
-    fprintf(fp, "%d ", it[i]);
-  }
-  fprintf(fp, "\n");
-  for (int i = 0; i < iter_number; i++) {
-    fprintf(fp, "%f ", tem[i]);
-  }
-  fclose(fp);
 
   PetscCall(MatDestroy(&A));
   PetscCall(VecDestroy(&rhs));

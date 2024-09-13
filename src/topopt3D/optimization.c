@@ -179,9 +179,8 @@ PetscErrorCode adjointGradient(PCCtx *s_ctx, MMAx *mma_text, KSP ksp, Mat A,
   PetscScalar ***arrayBoundary, ***arrayx, ***arraydc, ***arrayt,
       ***arraylambda, ***arraykappa[DIM];
   Vec lambda, kappa_loc[DIM], t_loc, lambda_loc;
-  PetscInt iter;
-  PetscLogEvent gradient;
-  PetscCall(PetscLogEventRegister("Gradient", 2, &gradient));
+  PetscLogEvent LS2;
+  PetscCall(PetscLogEventRegister("LS2", 3, &LS2));
   // calculate lambda
   PetscCall(DMCreateGlobalVector(s_ctx->dm, &lambda));
   // KSP ksp1;
@@ -196,9 +195,9 @@ PetscErrorCode adjointGradient(PCCtx *s_ctx, MMAx *mma_text, KSP ksp, Mat A,
   // PC pc;
   // PetscCall(KSPGetPC(ksp1, &pc));
   // PetscCall(PCSetType(pc, PCGAMG));
-  PetscCall(PetscLogEventBegin(gradient, 0, 0, 0, 0));
+  PetscCall(PetscLogEventBegin(LS2, 0, 0, 0, 0));
   PetscCall(KSPSolve(ksp, mma_text->dgT, lambda));
-  PetscCall(PetscLogEventEnd(gradient, 0, 0, 0, 0));
+  PetscCall(PetscLogEventEnd(LS2, 0, 0, 0, 0));
   PetscCall(KSPConvergedReasonView(ksp, PETSC_VIEWER_STDOUT_WORLD));
   PetscCall(
       DMDAGetCorners(s_ctx->dm, &startx, &starty, &startz, &nx, &ny, &nz));
