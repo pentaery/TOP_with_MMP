@@ -54,3 +54,4 @@ dkms.conf
 build/
 .cache/
 .vscode/
+.DS_store
