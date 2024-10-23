@@ -91,11 +91,13 @@ This repository contains the C code of a parallel solver for large-scale heat tr
 
 The solver relys on [PETSc](https://gitlab.com/petsc) together with some other packages like [SLEPc](https://gitlab.com/slepc), [SuperLU_DIST](https://github.com/xiaoyeli/superlu_dist) and [HDF5](https://github.com/HDFGroup) which you could install by PETSc.
 
+Note that PETSc only supports well for LINUX and MacOS. For Windows user, it's difficult to utilize it.
+
 
 ### Installation
 
-1. You should install MPI and BLAS/LAPACK first since PETSc relys on them. Here I recommend [oneAPI](https://www.intel.com/content/www/us/en/developer/tools/oneapi/toolkits.html#gs.h16c4b) where [Base Toolkit](https://www.intel.com/content/www/us/en/developer/tools/oneapi/base-toolkit-download.html) includes BLAS/LAPACK and [HPC Toolkit](https://www.intel.com/content/www/us/en/developer/tools/oneapi/hpc-toolkit-download.html) includes MPI.
-2. After installing oneAPI, you could [install](https://petsc.org/release/install/download/#doc-download) PETSc and build with 
+1. You should install MPI and BLAS/LAPACK first since PETSc relys on them. If you are using LINUX, here I recommend [oneAPI](https://www.intel.com/content/www/us/en/developer/tools/oneapi/toolkits.html#gs.h16c4b) where [Base Toolkit](https://www.intel.com/content/www/us/en/developer/tools/oneapi/base-toolkit-download.html) includes BLAS/LAPACK and [HPC Toolkit](https://www.intel.com/content/www/us/en/developer/tools/oneapi/hpc-toolkit-download.html) includes MPI. Since MacOS does not support oneAPI now, so you could turn to [MPICH](https://www.mpich.org/) or [OpenMPI](https://www.open-mpi.org/).
+2. After installing MPI and BLAS/LAPACK, you could [install](https://petsc.org/release/install/download/#doc-download) PETSc and build with 
    ```sh
    ./configure --with-cc=mpiicc --with-cxx=mpiicx --with-fc=mpiifx --download-hdf5 --download-superlu_dist --download-slepc
    make check
